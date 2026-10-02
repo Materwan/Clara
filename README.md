@@ -18,7 +18,8 @@ Runs the same on Linux and Windows (pure Python, SQLite, no native extension).
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"      # Windows: .venv\Scripts\pip
-cp .env.example .env                    # then put real tokens in CLARA_TOKENS
+cp .env.example .env                    # then put real tokens in CLARA_TOKENS (the server
+                                        # refuses the "change-me" placeholders)
 .venv/bin/clara-server                  # listens on 127.0.0.1:8765
 ```
 
@@ -63,6 +64,10 @@ Both consoles run the same commands (the `/` is optional):
 | --- | --- | --- |
 | `local` | Local host | Ollama on this machine, or any host in `OLLAMA_HOST`. Model: `CLARA_LOCAL_MODEL` |
 | `cloud` | Ollama API key | `ollama.com` with `OLLAMA_API_KEY`. Model: `CLARA_CLOUD_MODEL` |
+
+Models whose name ends in `-cloud` are not local: a local Ollama forwards them to ollama.com (they need
+`ollama signin`), and the window Clara requests from a local server (`num_ctx`) cannot be relied on for them,
+so set `CLARA_LOCAL_CONTEXT_WINDOW` to the window such a model really has.
 
 `/provider cloud` switches every client at once, without a restart, then checks
 that the provider answers (and, for `cloud`, that the key is accepted).

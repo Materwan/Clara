@@ -48,6 +48,7 @@ RECENT_TOOL_RESULTS_KEPT = 8  # older tool outputs are replaced by a note, to sa
 OMITTED = "[output omitted to save context]"
 DEFAULT_CONTEXT_WINDOW = 32_768
 PROMPT_LIMIT = 0.95  # share of the window a prompt may fill; beyond, the model would truncate it silently
+ROUND_SEPARATOR = "\n\n"  # between the texts of two model rounds
 MAX_MESSAGE_SHARE = 0.5  # share of the window a single new message may take
 
 
@@ -353,6 +354,8 @@ class Agent:
                 text_parts: list[str] = []
                 calls = []
                 round_prompt = round_completion = 0
+                # a round that follows one that said something starts a new paragraph
+                separate = bool("".join(reply_parts).strip())
                 # aclosing: if the client goes away at a yield, the model task stops now
                 async with contextlib.aclosing(self._model(messages, schemas if offer_tools else None)) as model:
                     async for chunk in model:
@@ -360,6 +363,10 @@ class Agent:
                         round_completion += chunk.completion_tokens
                         calls.extend(chunk.tool_calls)
                         if chunk.text:
+                            if separate and chunk.text.strip():
+                                separate = False
+                                reply_parts.append(ROUND_SEPARATOR)
+                                yield {"type": "token", "text": ROUND_SEPARATOR}
                             text_parts.append(chunk.text)
                             yield {"type": "token", "text": chunk.text}
                 prompt_tokens += round_prompt

@@ -15,6 +15,7 @@ class SettingsError(Exception):
     pass
 
 
+PLACEHOLDER_TOKEN = "change-me"  # what .env.example ships with
 SURFACE_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
@@ -152,6 +153,12 @@ class Settings:
                 "and put it in .env as CLARA_TOKENS=terminal:<token>"
             )
         admin_tokens = parse_tokens(env.get("CLARA_ADMIN_TOKENS", ""))
+        for token in (*tokens, *admin_tokens):
+            if token.lower().startswith(PLACEHOLDER_TOKEN):
+                raise SettingsError(
+                    "A token still has the placeholder value of .env.example. Generate a real one with:\n"
+                    '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+                )
         if set(tokens) & set(admin_tokens):
             raise SettingsError("A token cannot be both a chat token and an admin token.")
 
@@ -185,7 +192,7 @@ class Settings:
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),
             default_provider=default_provider,
             local_host=text("OLLAMA_HOST", DEFAULT_LOCAL_HOST),
-            local_model=text("CLARA_LOCAL_MODEL", "gemma4:31b-cloud"),
+            local_model=text("CLARA_LOCAL_MODEL", "llama3.2"),
             local_context_window=_positive_int(env, "CLARA_LOCAL_CONTEXT_WINDOW", 32_768),
             cloud_host=text("CLARA_CLOUD_HOST", DEFAULT_CLOUD_HOST),
             cloud_model=text("CLARA_CLOUD_MODEL", "gpt-oss:120b"),

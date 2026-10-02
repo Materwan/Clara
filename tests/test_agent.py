@@ -176,3 +176,30 @@ def test_an_unknown_timezone_is_refused(memory, tmp_path):
         assert "Mars/Olympus" in str(error)
     else:
         raise AssertionError("expected ValueError")
+
+
+async def test_texts_of_consecutive_model_rounds_are_separated(memory, tmp_path):
+    from clara.llm import LlmChunk, ToolCall
+
+    backend = FakeBackend(
+        [LlmChunk(text="Let me look."), LlmChunk(tool_calls=[ToolCall("remember", {"fact": "Likes tea"})])],
+        say("Here is ", "what I found."),
+    )
+    agent = make_agent(memory, tmp_path, backend)
+    events = await run(agent, message="look")
+
+    streamed = "".join(e["text"] for e in events if e["type"] == "token")
+    assert streamed == "Let me look.\n\nHere is what I found."
+    assert events[-1]["reply"] == streamed
+    stored = [m.content for m in memory.history("cli:erwan", 10) if m.role == "assistant"]
+    assert stored == ["Let me look.", "Here is what I found."]  # the stored rows stay as the model wrote them
+
+
+async def test_no_separator_when_the_first_round_said_nothing(memory, tmp_path):
+    from clara.llm import LlmChunk, ToolCall
+
+    backend = FakeBackend(
+        [LlmChunk(tool_calls=[ToolCall("remember", {"fact": "Likes tea"})])], say("Done."),
+    )
+    events = await run(make_agent(memory, tmp_path, backend), message="remember")
+    assert events[-1]["reply"] == "Done."

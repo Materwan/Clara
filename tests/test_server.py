@@ -140,3 +140,23 @@ def test_settings_refuse_to_start_without_tokens():
 def test_settings_token_parsing():
     parsed = Settings.from_env({"CLARA_TOKENS": "a:one, b:two ,three"}).tokens
     assert parsed == {"one": "a", "two": "b", "three": "client"}
+
+
+@pytest.mark.parametrize("variable", ["CLARA_TOKENS", "CLARA_ADMIN_TOKENS"])
+def test_settings_refuse_the_placeholder_tokens_of_the_example(variable):
+    env = {"CLARA_TOKENS": "terminal:secret-cli", variable: "terminal:Change-Me-too"}
+    with pytest.raises(SettingsError, match="placeholder"):
+        Settings.from_env(env)
+
+
+def test_the_example_env_file_does_not_start_as_it_is():
+    from pathlib import Path
+
+    env = {}
+    for line in (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            env[key] = value
+    with pytest.raises(SettingsError, match="placeholder"):
+        Settings.from_env(env)
+    assert not env["CLARA_LOCAL_MODEL"].endswith("-cloud")  # a model you can pull, not one that needs a sign-in
