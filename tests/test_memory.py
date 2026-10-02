@@ -53,7 +53,7 @@ def test_linking_an_existing_account_merges_both_people(memory):
     memory.add_fact(other.id, "Plays guitar")
     memory.add_exchange("discord:chan", other.id, "hi", "hello")
 
-    memory.link_account("discord", "1234", me)
+    memory.link_account("discord", "1234", me, force=True)
 
     assert memory.find_person("discord", "1234") == me
     assert [fact.text for fact in memory.facts(me.id)] == ["Lives in Paris", "Plays guitar"]

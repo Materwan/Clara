@@ -307,6 +307,6 @@ async def link_command(ctx: CommandContext, args: str) -> str:
     if not SURFACE_PATTERN.match(surface) or not external_id:
         raise CommandError("The account looks like surface:user, e.g. discord:1234.")
     target = find_person(ctx.memory, parts[1])
-    ctx.memory.link_account(surface, external_id, target)
+    ctx.memory.link_account(surface, external_id, target, force=True)
     accounts = ", ".join(f"{s}:{e}" for s, e in ctx.memory.accounts_of(target.id))
     return f"{target.name} now has: {accounts}"

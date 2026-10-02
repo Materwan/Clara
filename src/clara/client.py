@@ -22,8 +22,11 @@ HELP = """\
 /facts            what Clara remembers about you
 /remember <text>  store a fact
 /forget <id>      delete a fact
-/link <surface> <id>
-                  tell Clara that account (e.g. discord 1234) is you too
+/linkcode         a code that lets another account attach itself to you
+                  (valid 10 minutes, once)
+/link <surface> <id> <code>
+                  tell Clara that account (e.g. discord 1234) is you too; <code> is
+                  the one that account's own client gave it with its /linkcode
 /new              start a fresh conversation thread (facts are kept)
 /quit             leave"""
 
@@ -70,12 +73,18 @@ class ClaraApi:
     def forget(self, fact_id: int) -> None:
         self.http.delete(f"/v1/memory/facts/{fact_id}", params=self.identity()).raise_for_status()
 
-    def link(self, surface: str, external_id: str) -> list[str]:
+    def link_code(self) -> str:
+        response = self.http.post("/v1/accounts/link-code", json=self.identity())
+        response.raise_for_status()
+        return response.json()["code"]
+
+    def link(self, surface: str, external_id: str, code: str) -> list[str]:
         response = self.http.post(
             "/v1/accounts/link",
             json={
                 "surface": surface,
                 "user_id": external_id,
+                "code": code,
                 "to_surface": SURFACE,
                 "to_user_id": self.user,
             },
@@ -112,9 +121,11 @@ def command(api: ClaraApi, line: str) -> bool:
     elif name == "/forget" and argument.isdigit():
         api.forget(int(argument))
         print("Forgotten.")
-    elif name == "/link" and len(argument.split()) == 2:
-        surface, external_id = argument.split()
-        print("Accounts: " + ", ".join(api.link(surface, external_id)))
+    elif name == "/linkcode":
+        print(f"Code: {api.link_code()}  (valid 10 minutes, once)")
+    elif name == "/link" and len(argument.split()) == 3:
+        surface, external_id, code = argument.split()
+        print("Accounts: " + ", ".join(api.link(surface, external_id, code)))
     elif name == "/new":
         api.new_thread()
         print("New thread.")

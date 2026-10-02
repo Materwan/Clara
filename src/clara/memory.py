@@ -75,6 +75,10 @@ _ADDED_COLUMNS = {
 }
 
 
+class MergeRefused(ValueError):
+    """Both people already have facts or history: merging them is irreversible."""
+
+
 @dataclass(frozen=True)
 class Person:
     id: int
@@ -225,11 +229,24 @@ class Memory:
             ).fetchall()
         return [(row["surface"], row["external_id"]) for row in rows]
 
-    def link_account(self, surface: str, external_id: str, target: Person) -> Person:
+    def has_data(self, person_id: int) -> bool:
+        """Does the person own any fact or message?"""
+        with self._lock:
+            return self._db.execute(
+                "SELECT EXISTS (SELECT 1 FROM facts WHERE person_id = ?)"
+                " OR EXISTS (SELECT 1 FROM messages WHERE person_id = ?)",
+                (person_id, person_id),
+            ).fetchone()[0] == 1
+
+    def link_account(
+        self, surface: str, external_id: str, target: Person, force: bool = False
+    ) -> Person:
         """Make an account belong to `target`.
 
         If the account already had its own person, that person is merged into
-        `target`: facts and history move over, duplicate facts are dropped.
+        `target`: facts and history move over, duplicate facts are dropped. A merge
+        cannot be undone, so it is refused (MergeRefused) when both people already
+        have data, unless `force` (the operator's console).
         """
         with self._lock, self._db:
             current = self.find_person(surface, external_id)
@@ -239,6 +256,11 @@ class Memory:
                     (surface, external_id, target.id),
                 )
             elif current.id != target.id:
+                if not force and self.has_data(current.id) and self.has_data(target.id):
+                    raise MergeRefused(
+                        "Both accounts already have memories; an operator must merge them "
+                        "from the server console (/link)."
+                    )
                 self._merge(current.id, target.id)
         return target
 

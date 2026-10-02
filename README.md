@@ -82,8 +82,12 @@ switch the provider or edit memory, and an admin token cannot chat.
 
 A client identifies the speaker as `surface` + `user_id` (`cli`/`erwan`,
 `discord`/`1234`). Each pair is an *account*; accounts are tied to a *person*.
-Two accounts become one person with `POST /v1/accounts/link` (or `/link
-discord 1234` in `clara-chat`): their facts and history are merged.
+Two accounts become one person in two steps, so nobody can claim someone else's account: the
+account to attach asks its own client for a code (`POST /v1/accounts/link-code`, or `/linkcode` in
+`clara-chat`; valid 10 minutes, usable once), then the client of the person it joins sends it with
+`POST /v1/accounts/link` (or `/link discord 1234 <code>`). Facts and history are merged, but only
+if at most one of the two already has memories: merging two filled accounts cannot be undone, so
+an operator does it from the server console (`/link`).
 
 The model saves and removes facts itself through two tools, `remember` and
 `forget`, which can only touch the person who is talking.
@@ -102,7 +106,8 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 | `GET /v1/memory/facts?surface=&user_id=` | list a person's facts |
 | `POST /v1/memory/facts` | `{surface, user_id, text}` |
 | `DELETE /v1/memory/facts/{id}?surface=&user_id=` | |
-| `POST /v1/accounts/link` | `{surface, user_id, to_surface, to_user_id}` |
+| `POST /v1/accounts/link-code` | `{surface, user_id}` → `{code, expires_in}`: proof of control of that account |
+| `POST /v1/accounts/link` | `{surface, user_id, code, to_surface, to_user_id}`; 403 bad code, 409 both accounts have memories |
 | `DELETE /v1/conversations/{id}` | forget a thread, keep the facts |
 | `GET /health` | no auth; shows the active provider and model |
 | `GET /v1/admin/commands`, `POST /v1/admin/command` | `{line}` → `{output, quit}`; **admin token** only (used by `clara-admin`) |
@@ -175,8 +180,11 @@ with httpx.stream("POST", "http://127.0.0.1:8765/v1/chat/stream",
 
 - Tokens are required; the server refuses to start without any. Use one token
   per client so one can be revoked alone.
-- Clients are **trusted**: a token proves which client calls, and the client
-  says who is speaking. Do not hand a token to anything you don't control.
+- Clients are **trusted** within their surfaces: a token proves which client calls, and the client
+  says who is speaking. `CLARA_CLIENT_SURFACES` (`terminal=cli|console,discord=discord`) limits each
+  token to its surfaces: facts, conversations and accounts of other surfaces answer 403. A client
+  with no entry may use any surface (the server warns at startup). Do not hand a token to anything
+  you don't control.
 - It listens on `127.0.0.1` by default. To reach it from another machine, put
   it behind a VPN such as Tailscale or an HTTPS reverse proxy rather than
   exposing the port.

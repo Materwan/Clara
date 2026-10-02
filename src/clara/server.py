@@ -6,7 +6,8 @@
     GET    /v1/memory/facts             facts of an account's person
     POST   /v1/memory/facts
     DELETE /v1/memory/facts/{id}
-    POST   /v1/accounts/link            "this account is the same person as that one"
+    POST   /v1/accounts/link-code       a code proving control of an account
+    POST   /v1/accounts/link            "this account is the same person as that one" (needs the code)
     POST   /v1/turns/{id}/tool-results  a client's answer to a `tool_requests` event
     GET    /v1/conversations/{id}       size of the context, summary
     POST   /v1/conversations/{id}/compact   summarise the older messages
@@ -15,7 +16,8 @@
     POST   /v1/admin/command            run a console command              (admin token)
 
 Chat clients are trusted: the bearer token proves *which client* is calling, and
-the client states which user is talking. Give each client its own token.
+the client states which user is talking. Give each client its own token, and with
+CLARA_CLIENT_SURFACES limit the surfaces (and so the people and conversations) it can reach.
 Operator commands need a different kind of token (CLARA_ADMIN_TOKENS), so a
 chat client can never switch the provider or edit memory.
 """
@@ -40,7 +42,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from .agent import Agent, ChatRequest, ClientToolTimeout, NothingToCompact
 from .commands import CommandContext, CommandResult, registry
-from .memory import Memory, Person
+from .linking import LinkCodes
+from .memory import Memory, MergeRefused, Person
 from .prompt import SystemPrompt
 from .providers import ProviderManager
 from .settings import Settings, SettingsError
@@ -99,9 +102,15 @@ class FactBody(_Body):
     text: str = Field(min_length=1)
 
 
+class LinkCodeBody(_Body):
+    surface: Surface
+    user_id: ExternalId
+
+
 class LinkBody(_Body):
     surface: Surface  # the account to attach...
     user_id: ExternalId
+    code: str = Field(min_length=1, max_length=100)  # ...proved with the code it was given...
     to_surface: Surface  # ...to the person who owns this one
     to_user_id: ExternalId
 
@@ -143,6 +152,20 @@ def authenticate_admin(request: Request) -> str:
     return caller
 
 
+def require_surface(request: Request, client: str, surface: str) -> None:
+    """403 unless the client may speak for `surface` (CLARA_CLIENT_SURFACES)."""
+    allowed = request.app.state.settings.client_surfaces.get(client)
+    if allowed is not None and surface not in allowed:
+        raise HTTPException(403, f"This client may not use the surface {surface!r}")
+
+
+def require_conversation(request: Request, client: str, conversation: str) -> None:
+    """403 unless the conversation belongs to a surface the client may use."""
+    allowed = request.app.state.settings.client_surfaces.get(client)
+    if allowed is not None and not any(conversation.startswith(f"{surface}:") for surface in allowed):
+        raise HTTPException(403, "This client may not use that conversation")
+
+
 Client = Annotated[str, Depends(authenticate)]
 Admin = Annotated[str, Depends(authenticate_admin)]
 
@@ -181,6 +204,11 @@ async def with_keepalive(events: AsyncIterator[dict], interval: float = KEEPALIV
 
 def create_app(settings: Settings, providers: ProviderManager | None = None) -> FastAPI:
     memory = Memory(settings.db_path)
+    link_codes = LinkCodes()
+    for name in settings.unrestricted_clients:
+        log.warning(
+            "client %r may speak for any surface: set CLARA_CLIENT_SURFACES to limit it", name
+        )
     providers = providers or ProviderManager.from_settings(settings)
     agent = Agent(
         memory,
@@ -219,7 +247,10 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
     async def health() -> dict:
         return {"status": "ok", "provider": providers.active, "model": providers.model}
 
-    def checked(body: ChatBody) -> ChatRequest:
+    def checked(http: Request, client: str, body: ChatBody) -> ChatRequest:
+        require_surface(http, client, body.surface)
+        if body.conversation:
+            require_conversation(http, client, body.conversation)
         request = body.to_request()
         try:
             agent.validate(request)
@@ -228,10 +259,10 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         return request
 
     @app.post("/v1/chat")
-    async def chat(body: ChatBody, client: Client) -> dict:
+    async def chat(body: ChatBody, client: Client, http: Request) -> dict:
         if body.tools:
             raise HTTPException(422, "Client tools need a stream: use /v1/chat/stream")
-        request = checked(body)
+        request = checked(http, client, body)
         final: dict | None = None
         try:
             async for event in agent.turn(request, client):
@@ -242,8 +273,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         return final or {}
 
     @app.post("/v1/chat/stream")
-    async def chat_stream(body: ChatBody, client: Client) -> StreamingResponse:
-        request = checked(body)
+    async def chat_stream(body: ChatBody, client: Client, http: Request) -> StreamingResponse:
+        request = checked(http, client, body)
 
         async def events() -> AsyncIterator[str]:
             try:
@@ -263,7 +294,10 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         )
 
     @app.get("/v1/memory/facts")
-    async def list_facts(client: Client, surface: Surface, user_id: ExternalId) -> dict:
+    async def list_facts(
+        client: Client, http: Request, surface: Surface, user_id: ExternalId
+    ) -> dict:
+        require_surface(http, client, surface)
         person = known_person(surface, user_id)
         return {
             "person": {"id": person.id, "name": person.name},
@@ -271,7 +305,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         }
 
     @app.post("/v1/memory/facts", status_code=201)
-    async def add_fact(body: FactBody, client: Client) -> dict:
+    async def add_fact(body: FactBody, client: Client, http: Request) -> dict:
+        require_surface(http, client, body.surface)
         person = memory.resolve(body.surface, body.user_id, body.user_name)
         try:
             fact = memory.add_fact(person.id, body.text)
@@ -281,17 +316,34 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
 
     @app.delete("/v1/memory/facts/{fact_id}")
     async def delete_fact(
-        fact_id: int, client: Client, surface: Surface, user_id: ExternalId
+        fact_id: int, client: Client, http: Request, surface: Surface, user_id: ExternalId
     ) -> dict:
+        require_surface(http, client, surface)
         person = known_person(surface, user_id)
         if not memory.delete_fact(person.id, fact_id):
             raise HTTPException(404, "No such fact for this person")
         return {"deleted": fact_id}
 
+    @app.post("/v1/accounts/link-code")
+    async def issue_link_code(body: LinkCodeBody, client: Client, http: Request) -> dict:
+        """Step 1, from the client of the account to attach: a code valid for ten minutes."""
+        require_surface(http, client, body.surface)
+        code = link_codes.issue(body.surface, body.user_id)
+        return {"code": code, "expires_in": int(link_codes.lifetime)}
+
     @app.post("/v1/accounts/link")
-    async def link_accounts(body: LinkBody, client: Client) -> dict:
+    async def link_accounts(body: LinkBody, client: Client, http: Request) -> dict:
+        """Step 2, from the client of the person to attach to: the code proves that whoever
+        asks controls the account `surface:user_id`. Only the target's surface is checked here,
+        since the two accounts usually belong to different clients."""
+        require_surface(http, client, body.to_surface)
         target = known_person(body.to_surface, body.to_user_id)
-        person = memory.link_account(body.surface, body.user_id, target)
+        if not link_codes.redeem(body.surface, body.user_id, body.code):
+            raise HTTPException(403, "Wrong or expired link code")
+        try:
+            person = memory.link_account(body.surface, body.user_id, target)
+        except MergeRefused as error:
+            raise HTTPException(409, str(error)) from None
         accounts = [f"{surface}:{external}" for surface, external in memory.accounts_of(person.id)]
         return {"person": {"id": person.id, "name": person.name}, "accounts": accounts}
 
@@ -307,11 +359,15 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         return {"accepted": len(results)}
 
     @app.get("/v1/conversations/{conversation:path}")
-    async def conversation_info(conversation: str, client: Client) -> dict:
+    async def conversation_info(conversation: str, client: Client, http: Request) -> dict:
+        require_conversation(http, client, conversation)
         return agent.context(conversation)
 
     @app.post("/v1/conversations/{conversation:path}/compact")
-    async def compact_conversation(conversation: str, body: CompactBody, client: Client) -> dict:
+    async def compact_conversation(
+        conversation: str, body: CompactBody, client: Client, http: Request
+    ) -> dict:
+        require_conversation(http, client, conversation)
         try:
             before, after = await agent.compact(conversation, body.focus)
         except NothingToCompact as error:
@@ -326,7 +382,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         }
 
     @app.delete("/v1/conversations/{conversation:path}")
-    async def clear_conversation(conversation: str, client: Client) -> dict:
+    async def clear_conversation(conversation: str, client: Client, http: Request) -> dict:
+        require_conversation(http, client, conversation)
         return {"deleted_messages": memory.clear_conversation(conversation)}
 
     @app.get("/v1/admin/commands")

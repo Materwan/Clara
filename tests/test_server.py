@@ -112,7 +112,12 @@ def test_unknown_person_is_404(make_client):
 def test_link_accounts_shares_facts(make_client):
     client = make_client()
     client.post("/v1/memory/facts", json={**ME, "text": "Likes tea"}, headers=AUTH)
-    link = {"surface": "discord", "user_id": 42, "to_surface": "cli", "to_user_id": "erwan"}
+    code = client.post(
+        "/v1/accounts/link-code", json={"surface": "discord", "user_id": 42}, headers=AUTH
+    ).json()["code"]
+    link = {
+        "surface": "discord", "user_id": 42, "code": code, "to_surface": "cli", "to_user_id": "erwan",
+    }
     response = client.post("/v1/accounts/link", json=link, headers=AUTH)
     assert response.json()["accounts"] == ["cli:erwan", "discord:42"]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -12,6 +13,9 @@ from dotenv import load_dotenv
 
 class SettingsError(Exception):
     pass
+
+
+SURFACE_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
 def parse_tokens(raw: str) -> dict[str, str]:
@@ -32,6 +36,29 @@ def parse_tokens(raw: str) -> dict[str, str]:
             raise SettingsError(f"Empty token for client {name!r} in CLARA_TOKENS")
         tokens[token] = name
     return tokens
+
+
+def parse_client_surfaces(raw: str, clients: set[str]) -> dict[str, frozenset[str]]:
+    """`"terminal=cli|console,discord=discord"` -> the surfaces each client may speak for."""
+    allowed: dict[str, frozenset[str]] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, separator, surfaces = item.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            raise SettingsError(f"CLARA_CLIENT_SURFACES: expected name=surface|surface, got {item!r}")
+        if name not in clients:
+            raise SettingsError(f"CLARA_CLIENT_SURFACES: {name!r} is not a client of CLARA_TOKENS")
+        names = frozenset(part.strip() for part in surfaces.split("|") if part.strip())
+        if not names:
+            raise SettingsError(f"CLARA_CLIENT_SURFACES: no surface for {name!r}")
+        for surface in names:
+            if not SURFACE_RE.match(surface):
+                raise SettingsError(f"CLARA_CLIENT_SURFACES: bad surface {surface!r} (a-z, 0-9, _ -)")
+        allowed[name] = names | allowed.get(name, frozenset())
+    return allowed
 
 
 def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
@@ -72,6 +99,8 @@ class Settings:
     data_dir: Path
     tokens: dict[str, str] = field(repr=False)  # chat token -> client name
     admin_tokens: dict[str, str] = field(repr=False)  # console token -> admin name
+    # client name -> surfaces it may speak for; a client with no entry may use any
+    client_surfaces: dict[str, frozenset[str]]
     history_turns: int
     max_concurrent_llm: int
     max_tool_rounds: int
@@ -87,6 +116,11 @@ class Settings:
     cloud_model: str
     cloud_context_window: int
     ollama_api_key: str | None = field(repr=False)
+
+    @property
+    def unrestricted_clients(self) -> list[str]:
+        """Clients allowed to speak for any surface (no CLARA_CLIENT_SURFACES entry)."""
+        return sorted(set(self.tokens.values()) - set(self.client_surfaces))
 
     @property
     def db_path(self) -> Path:
@@ -117,6 +151,10 @@ class Settings:
         if set(tokens) & set(admin_tokens):
             raise SettingsError("A token cannot be both a chat token and an admin token.")
 
+        client_surfaces = parse_client_surfaces(
+            env.get("CLARA_CLIENT_SURFACES", ""), set(tokens.values())
+        )
+
         api_key = text("OLLAMA_API_KEY") or None
         default_provider = text("CLARA_PROVIDER", "local").lower()
         if default_provider not in PROVIDER_IDS:
@@ -130,6 +168,7 @@ class Settings:
             data_dir=Path(text("CLARA_DATA_DIR", "data")),
             tokens=tokens,
             admin_tokens=admin_tokens,
+            client_surfaces=client_surfaces,
             history_turns=_positive_int(env, "CLARA_HISTORY_TURNS", 20),
             max_concurrent_llm=_positive_int(env, "CLARA_MAX_CONCURRENT_LLM", 2),
             max_tool_rounds=_positive_int(env, "CLARA_MAX_TOOL_ROUNDS", 40),
