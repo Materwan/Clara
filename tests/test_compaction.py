@@ -160,3 +160,57 @@ async def test_the_size_after_compaction_counts_the_kept_turns(memory, tmp_path)
     assert after > 100 * kept_tokens / 4_000
     assert after < before
     assert memory.state(CONVERSATION).context_tokens == pytest.approx(after * 40, abs=1)
+
+
+# --- the gap between the history limit and the context limit ------------------------
+
+
+async def turn_events(agent: Agent, message: str) -> list[dict]:
+    return [event async for event in agent.turn(ChatRequest("cli", "erwan", "Erwan", message))]
+
+
+async def test_turns_that_leave_the_history_window_are_summarised_not_dropped(memory, tmp_path):
+    backend = FakeBackend(*[say(f"a{i}") for i in range(1, 5)], say("summary of 1-3"), say("a5"))
+    agent = make_agent(memory, tmp_path, backend, history_turns=3, compact_percent=80, keep_recent_turns=2)
+    for i in range(1, 5):
+        assert "compacted" not in [e["type"] for e in await turn_events(agent, f"q{i}")]
+
+    events = await turn_events(agent, "q5")  # the 5th turn would push q1 out of a 3-turn history
+
+    assert [e["type"] for e in events][:2] == ["turn", "compacted"]
+    prompt = backend.calls[-1][0]
+    assert "summary of 1-3" in prompt[0]["content"]
+    assert [untimed(m["content"]) for m in prompt[1:]] == ["q4", "a4", "q5"]  # half the history is kept
+    assert "q1" in backend.calls[4][0][1]["content"]  # what went into the summary
+
+
+async def test_the_history_gap_is_not_compacted_when_compaction_is_off(memory, tmp_path):
+    backend = FakeBackend(*[say(f"a{i}") for i in range(1, 6)])
+    agent = make_agent(memory, tmp_path, backend, history_turns=3, compact_percent=0)
+    for i in range(1, 6):
+        await talk(agent, f"q{i}")
+    assert len(backend.calls) == 5  # no summary request
+    assert memory.state(CONVERSATION).summary == ""
+
+
+class FailingSummary(FakeBackend):
+    async def stream(self, messages, tools):
+        if messages[0]["content"].startswith("You are summarising"):
+            raise RuntimeError("model unavailable")
+        async for chunk in super().stream(messages, tools):
+            yield chunk
+
+
+async def test_a_failed_compaction_falls_back_to_truncating_the_history(memory, tmp_path):
+    backend = FailingSummary(*[say(f"a{i}") for i in range(1, 6)])
+    agent = make_agent(memory, tmp_path, backend, history_turns=3, compact_percent=80)
+    for i in range(1, 5):
+        await talk(agent, f"q{i}")
+
+    events = await turn_events(agent, "q5")
+
+    types = [e["type"] for e in events]
+    assert "warning" in types and types[-1] == "done"
+    assert events[-1]["reply"] == "a5"
+    prompt = backend.calls[-1][0]
+    assert [untimed(m["content"]) for m in prompt[1:]] == ["q2", "a2", "q3", "a3", "q4", "a4", "q5"]

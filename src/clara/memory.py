@@ -342,6 +342,14 @@ class Memory:
             ).fetchall()
         return [self._stored(row) for row in rows]
 
+    def turns_after(self, conversation: str, after_id: int = 0) -> int:
+        """How many turns (user messages) a conversation has after `after_id`."""
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation = ? AND role = 'user' AND id > ?",
+                (conversation, after_id),
+            ).fetchone()[0]
+
     def messages_after(self, conversation: str, after_id: int = 0) -> list[StoredMessage]:
         """Every message of a conversation after `after_id`, oldest first."""
         with self._lock:

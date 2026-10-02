@@ -260,6 +260,18 @@ class Agent:
         lock = contextlib.nullcontext() if ephemeral else self._conversation_lock(conversation)
         async with lock:
             state = ConversationState() if ephemeral else self.memory.state(conversation)
+            if not ephemeral and self._history_overflows(conversation, state):
+                # Older turns would fall out of the prompt without ever being summarised: summarise
+                # them now, and keep half the history so this does not happen at every turn.
+                try:
+                    before, after = await self._compact_locked(
+                        conversation, keep_recent_turns=max(1, self.history_turns // 2)
+                    )
+                    yield {"type": "compacted", "before": before, "after": after}
+                except Exception as error:
+                    log.warning("compaction of %s before the turn failed: %s", conversation, error)
+                    yield {"type": "warning", "message": f"Could not compact the conversation: {error}"}
+                state = self.memory.state(conversation)  # also after a failure: it may have advanced
             messages = self._build_messages(request, person, state)
             rows: list[TurnRow] = []
             reply_parts: list[str] = []
@@ -350,6 +362,12 @@ class Agent:
             "model": getattr(self.backend, "model", ""),  # may change between turns (/provider)
             "provider": getattr(self.backend, "active", ""),
         }
+
+    def _history_overflows(self, conversation: str, state: ConversationState) -> bool:
+        """Are there more turns waiting than the prompt takes back (`history_turns`)?"""
+        return bool(self.compact_percent) and (
+            self.memory.turns_after(conversation, state.upto_id) > self.history_turns
+        )
 
     def _context_info(self, tokens: int) -> dict:
         window = self.window

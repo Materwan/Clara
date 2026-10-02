@@ -160,7 +160,9 @@ so) and from then on sends the summary instead of them; the messages stay in the
 /v1/conversations/{id}/compact` does it on demand, with an optional focus. The last
 `CLARA_KEEP_RECENT_TURNS` turns (2) are not summarised: the model goes on from them word for word. A
 conversation that is too long for one summary request is summarised in several steps, each continuing
-the previous one, so no message is skipped. The summary is not meant to shrink conversations that are
+the previous one, so no message is skipped. The same happens when a conversation has more turns than `CLARA_HISTORY_TURNS`: the oldest
+are summarised (half of the history is kept) instead of silently falling out of the prompt, as long
+as `CLARA_COMPACT_PERCENT` is not 0. The summary is not meant to shrink conversations that are
 already short.
 
 ### Writing a client

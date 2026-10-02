@@ -110,7 +110,7 @@ async def test_old_tool_outputs_are_dropped_from_the_replay(memory, tmp_path):
 
 async def test_history_keeps_only_the_last_turns(memory, tmp_path):
     backend = FakeBackend(*[say(f"a{i}") for i in range(4)])
-    agent = make_agent(memory, tmp_path, backend, history_turns=2)
+    agent = make_agent(memory, tmp_path, backend, history_turns=2, compact_percent=0)  # plain truncation: compaction is off
     for index in range(3):
         await drive(agent, request(message=f"q{index}"))
     await drive(agent, request(message="q3"))
