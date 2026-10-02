@@ -67,8 +67,8 @@ def test_history_is_per_conversation_and_ordered(memory):
     memory.add_exchange("b", person.id, "other", "thread")
 
     assert [m.content for m in memory.history("a", 10)] == ["q1", "r1", "q2", "r2"]
-    assert [m.content for m in memory.history("a", 2)] == ["q2", "r2"]
-    assert memory.history("a", 1)[0].role == "assistant"
+    assert [m.content for m in memory.history("a", 1)] == ["q2", "r2"]
+    assert memory.history("a", 1)[0].role == "user"
     assert memory.history("a", 10)[0].author == "Alice"
     assert memory.clear_conversation("a") == 4
     assert memory.history("a", 10) == []

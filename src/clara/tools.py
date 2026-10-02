@@ -54,6 +54,10 @@ class Toolbox:
         self._tools = {tool.name: tool for tool in tools}
         self.schemas = [tool.schema for tool in tools]
 
+    @property
+    def names(self) -> frozenset[str]:
+        return frozenset(self._tools)
+
     def run(self, name: str, context: ToolContext, arguments: dict[str, Any]) -> str:
         """Run a tool; whatever goes wrong comes back as text for the model to read."""
         tool = self._tools.get(name)

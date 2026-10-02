@@ -40,6 +40,8 @@ class ProviderConfig:
     default_model: str
     api_key: str | None
     needs_key: bool
+    context_window: int = 32_768  # tokens: what the percentages of the context are relative to
+    request_context: bool = False  # ask the server for exactly that window (local Ollama only)
 
     @property
     def usable(self) -> bool:
@@ -60,13 +62,25 @@ _ALIASES = {
 
 
 def default_factory(config: ProviderConfig, model: str) -> LlmBackend:
-    return OllamaBackend(model, host=config.host, api_key=config.api_key)
+    return OllamaBackend(
+        model,
+        host=config.host,
+        api_key=config.api_key,
+        num_ctx=config.context_window if config.request_context else None,
+    )
 
 
 def configs_from_settings(settings: Settings) -> dict[str, ProviderConfig]:
     return {
         "local": ProviderConfig(
-            "local", "Local host", settings.local_host, settings.local_model, None, False
+            "local",
+            "Local host",
+            settings.local_host,
+            settings.local_model,
+            None,
+            False,
+            settings.local_context_window,
+            request_context=True,
         ),
         "cloud": ProviderConfig(
             "cloud",
@@ -75,6 +89,7 @@ def configs_from_settings(settings: Settings) -> dict[str, ProviderConfig]:
             settings.cloud_model,
             settings.ollama_api_key,
             True,
+            settings.cloud_context_window,
         ),
     }
 
@@ -116,6 +131,10 @@ class ProviderManager:
     @property
     def model(self) -> str:
         return self._models[self.active]
+
+    @property
+    def context_window(self) -> int:
+        return self.config.context_window
 
     def model_of(self, provider: str) -> str:
         return self._models[provider]

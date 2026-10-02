@@ -16,6 +16,7 @@ is a few milliseconds, so it is called directly from async code.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -52,10 +53,26 @@ CREATE TABLE IF NOT EXISTS messages (
     person_id    INTEGER REFERENCES people (id),
     role         TEXT NOT NULL,
     content      TEXT NOT NULL,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    prefix       TEXT NOT NULL DEFAULT '',
+    tool_calls   TEXT,
+    tool_name    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation, id);
+CREATE TABLE IF NOT EXISTS conversation_state (
+    conversation   TEXT PRIMARY KEY,
+    summary        TEXT NOT NULL DEFAULT '',
+    upto_id        INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0
+);
 """
+
+# Columns added after the first release: databases created before have to get them.
+_ADDED_COLUMNS = {
+    "prefix": "TEXT NOT NULL DEFAULT ''",
+    "tool_calls": "TEXT",
+    "tool_name": "TEXT",
+}
 
 
 @dataclass(frozen=True)
@@ -79,10 +96,31 @@ class Fact:
 
 @dataclass(frozen=True)
 class StoredMessage:
-    role: str  # "user" or "assistant"
+    role: str  # "user", "assistant" or "tool"
     content: str
     person_id: int | None
     author: str | None  # display name of the person who wrote it (user messages)
+    id: int = 0
+    prefix: str = ""  # context the client put before a user message (kept for the model, not shown)
+    tool_calls: list[dict] | None = None  # assistant messages: [{"function": {"name", "arguments"}}]
+    tool_name: str | None = None  # tool messages: which tool answered
+
+
+@dataclass(frozen=True)
+class TurnRow:
+    """A message produced during a turn, after the user's: the answer, a tool call, a result."""
+
+    role: str
+    content: str
+    tool_calls: list[dict] | None = None
+    tool_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ConversationState:
+    summary: str = ""  # replaces every message up to `upto_id`
+    upto_id: int = 0
+    context_tokens: int = 0  # size of the context at the end of the last turn
 
 
 def _now() -> str:
@@ -102,6 +140,10 @@ class Memory:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
+        present = {row["name"] for row in self._db.execute("PRAGMA table_info(messages)")}
+        for column, definition in _ADDED_COLUMNS.items():
+            if column not in present:
+                self._db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
         self._db.commit()
 
     def close(self) -> None:
@@ -245,35 +287,125 @@ class Memory:
     # ------------------------------------------------------------------
     # Conversation history
     # ------------------------------------------------------------------
-    def history(self, conversation: str, limit: int) -> list[StoredMessage]:
-        """The last `limit` messages of a conversation, oldest first."""
+    _MESSAGE_COLUMNS = (
+        "SELECT m.id, m.role, m.content, m.person_id, p.name, m.prefix, m.tool_calls, m.tool_name"
+        " FROM messages m LEFT JOIN people p ON p.id = m.person_id"
+    )
+
+    @staticmethod
+    def _stored(row: sqlite3.Row) -> StoredMessage:
+        return StoredMessage(
+            row["role"],
+            row["content"],
+            row["person_id"],
+            row["name"],
+            row["id"],
+            row["prefix"],
+            json.loads(row["tool_calls"]) if row["tool_calls"] else None,
+            row["tool_name"],
+        )
+
+    def history(self, conversation: str, turns: int, after_id: int = 0) -> list[StoredMessage]:
+        """The last `turns` turns of a conversation (each from a user message to the
+        next one, tool calls included), oldest first, ignoring messages up to `after_id`."""
+        with self._lock:
+            start = self._db.execute(
+                "SELECT id FROM messages WHERE conversation = ? AND role = 'user' AND id > ?"
+                " ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (conversation, after_id, max(turns, 1) - 1),
+            ).fetchone()
+            rows = self._db.execute(
+                self._MESSAGE_COLUMNS + " WHERE m.conversation = ? AND m.id >= ? ORDER BY m.id",
+                (conversation, start["id"] if start else after_id + 1),
+            ).fetchall()
+        return [self._stored(row) for row in rows]
+
+    def messages_after(self, conversation: str, after_id: int = 0) -> list[StoredMessage]:
+        """Every message of a conversation after `after_id`, oldest first."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT m.role, m.content, m.person_id, p.name FROM messages m"
-                " LEFT JOIN people p ON p.id = m.person_id"
-                " WHERE m.conversation = ? ORDER BY m.id DESC LIMIT ?",
-                (conversation, limit),
+                self._MESSAGE_COLUMNS + " WHERE m.conversation = ? AND m.id > ? ORDER BY m.id",
+                (conversation, after_id),
             ).fetchall()
-        return [
-            StoredMessage(row["role"], row["content"], row["person_id"], row["name"])
-            for row in reversed(rows)
-        ]
+        return [self._stored(row) for row in rows]
 
-    def add_exchange(self, conversation: str, person_id: int, question: str, answer: str) -> None:
-        """Store a question and its answer together, or neither."""
+    def last_message_id(self, conversation: str) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(id) FROM messages WHERE conversation = ?", (conversation,)
+            ).fetchone()
+        return row[0] or 0
+
+    def add_turn(
+        self,
+        conversation: str,
+        person_id: int,
+        question: str,
+        rows: list[TurnRow],
+        prefix: str = "",
+    ) -> None:
+        """Store a question and everything that followed it (calls, results, answer), or nothing."""
         now = _now()
         with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO messages (conversation, person_id, role, content, created_at, prefix)"
+                " VALUES (?, ?, 'user', ?, ?, ?)",
+                (conversation, person_id, question, now, prefix),
+            )
             self._db.executemany(
-                "INSERT INTO messages (conversation, person_id, role, content, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO messages (conversation, person_id, role, content, created_at,"
+                " tool_calls, tool_name) VALUES (?, NULL, ?, ?, ?, ?, ?)",
                 [
-                    (conversation, person_id, "user", question, now),
-                    (conversation, None, "assistant", answer, now),
+                    (
+                        conversation,
+                        row.role,
+                        row.content,
+                        now,
+                        json.dumps(row.tool_calls, ensure_ascii=False) if row.tool_calls else None,
+                        row.tool_name,
+                    )
+                    for row in rows
                 ],
             )
 
+    def add_exchange(self, conversation: str, person_id: int, question: str, answer: str) -> None:
+        """Store a question and its plain answer."""
+        self.add_turn(conversation, person_id, question, [TurnRow("assistant", answer)])
+
     def clear_conversation(self, conversation: str) -> int:
         with self._lock, self._db:
+            self._db.execute("DELETE FROM conversation_state WHERE conversation = ?", (conversation,))
             return self._db.execute(
                 "DELETE FROM messages WHERE conversation = ?", (conversation,)
             ).rowcount
+
+    # ------------------------------------------------------------------
+    # Summary and size of a conversation
+    # ------------------------------------------------------------------
+    def state(self, conversation: str) -> ConversationState:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT summary, upto_id, context_tokens FROM conversation_state"
+                " WHERE conversation = ?",
+                (conversation,),
+            ).fetchone()
+        return ConversationState(*row) if row else ConversationState()
+
+    def set_context_tokens(self, conversation: str, tokens: int) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO conversation_state (conversation, context_tokens) VALUES (?, ?)"
+                " ON CONFLICT (conversation) DO UPDATE SET context_tokens = excluded.context_tokens",
+                (conversation, tokens),
+            )
+
+    def set_summary(self, conversation: str, summary: str, upto_id: int, context_tokens: int) -> None:
+        """From now on `summary` stands for every message up to `upto_id`."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO conversation_state (conversation, summary, upto_id, context_tokens)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (conversation) DO UPDATE SET"
+                " summary = excluded.summary, upto_id = excluded.upto_id,"
+                " context_tokens = excluded.context_tokens",
+                (conversation, summary, upto_id, context_tokens),
+            )

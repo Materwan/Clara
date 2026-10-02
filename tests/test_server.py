@@ -57,7 +57,7 @@ def test_chat_stream_sends_sse_events(make_client):
     with client.stream("POST", "/v1/chat/stream", json={**ME, "message": "hi"}, headers=AUTH) as r:
         assert r.headers["content-type"].startswith("text/event-stream")
         events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ")]
-    assert [e["type"] for e in events] == ["token", "token", "done"]
+    assert [e["type"] for e in events] == ["turn", "token", "token", "usage", "done"]
     assert events[-1]["reply"] == "Hello"
 
 

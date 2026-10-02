@@ -51,8 +51,10 @@ class OllamaBackend:
         host: str | None = None,
         api_key: str | None = None,
         client: Any = None,
+        num_ctx: int | None = None,
     ):
         self.model = model
+        self._options = {"num_ctx": num_ctx} if num_ctx else None  # Ollama's own default is tiny
         self._host = (host or "").rstrip("/")
         self._api_key = api_key
         if client is None:
@@ -64,7 +66,11 @@ class OllamaBackend:
         self, messages: list[dict], tools: list[dict] | None
     ) -> AsyncIterator[LlmChunk]:
         response = await self._client.chat(
-            model=self.model, messages=messages, tools=tools or None, stream=True
+            model=self.model,
+            messages=messages,
+            tools=tools or None,
+            stream=True,
+            options=self._options,
         )
         async for part in response:
             message = part.message

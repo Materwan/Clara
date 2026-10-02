@@ -52,6 +52,19 @@ DEFAULT_CLOUD_HOST = "https://ollama.com"
 PROVIDER_IDS = ("local", "cloud")
 
 
+def _non_negative_int(env: Mapping[str, str], key: str, default: int) -> int:
+    raw = env.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SettingsError(f"{key} must be an integer, got {raw!r}") from None
+    if value < 0:
+        raise SettingsError(f"{key} cannot be negative")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str
@@ -59,15 +72,20 @@ class Settings:
     data_dir: Path
     tokens: dict[str, str] = field(repr=False)  # chat token -> client name
     admin_tokens: dict[str, str] = field(repr=False)  # console token -> admin name
-    history_messages: int
+    history_turns: int
     max_concurrent_llm: int
+    max_tool_rounds: int
+    tool_timeout: int  # seconds a client may take to run its tools (it may ask the user first)
+    compact_percent: int  # summarise a conversation when its context is this full (0 = never)
     system_prompt_file: Path
     # Language model providers (see providers.py)
     default_provider: str
     local_host: str
     local_model: str
+    local_context_window: int
     cloud_host: str
     cloud_model: str
+    cloud_context_window: int
     ollama_api_key: str | None = field(repr=False)
 
     @property
@@ -112,13 +130,18 @@ class Settings:
             data_dir=Path(text("CLARA_DATA_DIR", "data")),
             tokens=tokens,
             admin_tokens=admin_tokens,
-            history_messages=_positive_int(env, "CLARA_HISTORY_MESSAGES", 20),
+            history_turns=_positive_int(env, "CLARA_HISTORY_TURNS", 20),
             max_concurrent_llm=_positive_int(env, "CLARA_MAX_CONCURRENT_LLM", 2),
+            max_tool_rounds=_positive_int(env, "CLARA_MAX_TOOL_ROUNDS", 40),
+            tool_timeout=_positive_int(env, "CLARA_TOOL_TIMEOUT", 900),
+            compact_percent=_non_negative_int(env, "CLARA_COMPACT_PERCENT", 80),
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),
             default_provider=default_provider,
             local_host=text("OLLAMA_HOST", DEFAULT_LOCAL_HOST),
             local_model=text("CLARA_LOCAL_MODEL", "gemma4:31b-cloud"),
+            local_context_window=_positive_int(env, "CLARA_LOCAL_CONTEXT_WINDOW", 32_768),
             cloud_host=text("CLARA_CLOUD_HOST", DEFAULT_CLOUD_HOST),
             cloud_model=text("CLARA_CLOUD_MODEL", "gpt-oss:120b"),
+            cloud_context_window=_positive_int(env, "CLARA_CLOUD_CONTEXT_WINDOW", 131_072),
             ollama_api_key=api_key,
         )

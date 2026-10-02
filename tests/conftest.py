@@ -31,8 +31,10 @@ class FakeBackend:
             yield chunk
 
 
-def say(*pieces: str) -> list[LlmChunk]:
-    return [LlmChunk(text=piece) for piece in pieces] + [LlmChunk(prompt_tokens=10, completion_tokens=3)]
+def say(*pieces: str, prompt_tokens: int = 10, completion_tokens: int = 3) -> list[LlmChunk]:
+    return [LlmChunk(text=piece) for piece in pieces] + [
+        LlmChunk(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    ]
 
 
 def call(name: str, **arguments) -> list[LlmChunk]:

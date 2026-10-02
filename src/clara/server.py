@@ -7,6 +7,9 @@
     POST   /v1/memory/facts
     DELETE /v1/memory/facts/{id}
     POST   /v1/accounts/link            "this account is the same person as that one"
+    POST   /v1/turns/{id}/tool-results  a client's answer to a `tool_requests` event
+    GET    /v1/conversations/{id}       size of the context, summary
+    POST   /v1/conversations/{id}/compact   summarise the older messages
     DELETE /v1/conversations/{id}       forget the thread (facts are kept)
     GET    /v1/admin/commands           console commands, for completion   (admin token)
     POST   /v1/admin/command            run a console command              (admin token)
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -34,7 +38,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from .agent import Agent, ChatRequest
+from .agent import Agent, ChatRequest, ClientToolTimeout, NothingToCompact
 from .commands import CommandContext, CommandResult, registry
 from .memory import Memory, Person
 from .prompt import SystemPrompt
@@ -60,11 +64,32 @@ class ChatBody(_Body):
     surface: Surface
     user_id: ExternalId
     user_name: str | None = Field(default=None, max_length=80)
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(min_length=1, max_length=200_000)
     conversation: str | None = Field(default=None, min_length=1, max_length=200)
+    # What a client can add to a turn (see agent.py):
+    tools: list[dict[str, Any]] = Field(default_factory=list, max_length=200)  # tools it runs itself
+    instructions: str = Field(default="", max_length=100_000)  # added to the system prompt
+    prefix: str = Field(default="", max_length=50_000)  # put before the message, never summarised
+    ephemeral: bool = False  # one-shot job: no persona, no memory, nothing stored
 
     def to_request(self) -> ChatRequest:
-        return ChatRequest(self.surface, self.user_id, self.user_name, self.message, self.conversation)
+        return ChatRequest(
+            self.surface, self.user_id, self.user_name, self.message, self.conversation,
+            tuple(self.tools), self.instructions, self.prefix, self.ephemeral,
+        )
+
+
+class ToolResult(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    content: str = Field(max_length=2_000_000)
+
+
+class ToolResultsBody(BaseModel):
+    results: list[ToolResult] = Field(max_length=100)
+
+
+class CompactBody(BaseModel):
+    focus: str = Field(default="", max_length=2000)
 
 
 class FactBody(_Body):
@@ -126,6 +151,34 @@ def sse(event: dict) -> str:
     return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+KEEPALIVE_SECONDS = 15.0
+
+
+async def with_keepalive(events: AsyncIterator[dict], interval: float = KEEPALIVE_SECONDS) -> AsyncIterator[dict | None]:
+    """The events, plus a None every `interval` seconds of silence (a client may spend minutes
+    running a tool, and idle connections get dropped by proxies)."""
+    iterator = events.__aiter__()
+    pending = asyncio.ensure_future(iterator.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield None
+                continue
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                return
+            yield event
+            pending = asyncio.ensure_future(iterator.__anext__())
+    finally:
+        pending.cancel()
+        with contextlib.suppress(BaseException):
+            await pending
+        with contextlib.suppress(Exception):
+            await iterator.aclose()  # type: ignore[attr-defined]
+
+
 def create_app(settings: Settings, providers: ProviderManager | None = None) -> FastAPI:
     memory = Memory(settings.db_path)
     providers = providers or ProviderManager.from_settings(settings)
@@ -134,8 +187,12 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         providers,
         default_toolbox(),
         SystemPrompt(settings.system_prompt_file),
-        history_messages=settings.history_messages,
+        history_turns=settings.history_turns,
         max_concurrent_llm=settings.max_concurrent_llm,
+        max_tool_rounds=settings.max_tool_rounds,
+        context_window=lambda: providers.context_window,
+        compact_percent=settings.compact_percent,
+        tool_timeout=settings.tool_timeout,
     )
 
     @asynccontextmanager
@@ -162,11 +219,22 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
     async def health() -> dict:
         return {"status": "ok", "provider": providers.active, "model": providers.model}
 
+    def checked(body: ChatBody) -> ChatRequest:
+        request = body.to_request()
+        try:
+            agent.validate(request)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        return request
+
     @app.post("/v1/chat")
     async def chat(body: ChatBody, client: Client) -> dict:
+        if body.tools:
+            raise HTTPException(422, "Client tools need a stream: use /v1/chat/stream")
+        request = checked(body)
         final: dict | None = None
         try:
-            async for event in agent.turn(body.to_request()):
+            async for event in agent.turn(request, client):
                 final = event
         except Exception:
             log.exception("chat failed (client=%s)", client)
@@ -175,10 +243,15 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
 
     @app.post("/v1/chat/stream")
     async def chat_stream(body: ChatBody, client: Client) -> StreamingResponse:
+        request = checked(body)
+
         async def events() -> AsyncIterator[str]:
             try:
-                async for event in agent.turn(body.to_request()):
-                    yield sse(event)
+                async with contextlib.aclosing(with_keepalive(agent.turn(request, client))) as stream:
+                    async for event in stream:
+                        yield ": keepalive\n\n" if event is None else sse(event)
+            except ClientToolTimeout as error:
+                yield sse({"type": "error", "message": str(error)})
             except Exception:
                 log.exception("chat stream failed (client=%s)", client)
                 yield sse({"type": "error", "message": "The language model failed"})
@@ -221,6 +294,36 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         person = memory.link_account(body.surface, body.user_id, target)
         accounts = [f"{surface}:{external}" for surface, external in memory.accounts_of(person.id)]
         return {"person": {"id": person.id, "name": person.name}, "accounts": accounts}
+
+    @app.post("/v1/turns/{turn_id}/tool-results")
+    async def tool_results(turn_id: str, body: ToolResultsBody, client: Client) -> dict:
+        results = {item.id: item.content for item in body.results}
+        try:
+            agent.submit_results(turn_id, client, results)
+        except KeyError:
+            raise HTTPException(404, "No turn of yours is waiting for tool results") from None
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
+        return {"accepted": len(results)}
+
+    @app.get("/v1/conversations/{conversation:path}")
+    async def conversation_info(conversation: str, client: Client) -> dict:
+        return agent.context(conversation)
+
+    @app.post("/v1/conversations/{conversation:path}/compact")
+    async def compact_conversation(conversation: str, body: CompactBody, client: Client) -> dict:
+        try:
+            before, after = await agent.compact(conversation, body.focus)
+        except NothingToCompact as error:
+            raise HTTPException(409, str(error)) from None
+        except Exception:
+            log.exception("compaction failed (client=%s)", client)
+            raise HTTPException(502, "The language model failed") from None
+        return {
+            "before_percent": round(before, 1),
+            "after_percent": round(after, 1),
+            "summary": memory.state(conversation).summary,
+        }
 
     @app.delete("/v1/conversations/{conversation:path}")
     async def clear_conversation(conversation: str, client: Client) -> dict:

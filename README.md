@@ -95,7 +95,10 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 | Route | |
 | --- | --- |
 | `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}` |
-| `POST /v1/chat/stream` | same body; Server-Sent Events `token` / `tool` / `done` / `error` |
+| `POST /v1/chat/stream` | same body; Server-Sent Events `turn` / `token` / `tool` / `tool_requests` / `usage` / `compacted` / `warning` / `done` / `error` |
+| `POST /v1/turns/{id}/tool-results` | `{results: [{id, content}]}`: a client's answer to a `tool_requests` event (see below) |
+| `GET /v1/conversations/{id}` | `{tokens, window, percent, summary, messages}`: how full the context is |
+| `POST /v1/conversations/{id}/compact` | `{focus?}` → `{before_percent, after_percent, summary}`: summarise the older messages |
 | `GET /v1/memory/facts?surface=&user_id=` | list a person's facts |
 | `POST /v1/memory/facts` | `{surface, user_id, text}` |
 | `DELETE /v1/memory/facts/{id}?surface=&user_id=` | |
@@ -109,6 +112,43 @@ client such as a Discord channel should pass its own id (`discord:channel:42`);
 messages from other people in that thread reach the model prefixed with their name.
 
 Interactive docs: `http://127.0.0.1:8765/docs`.
+
+### Tools that run on the client
+
+A client can give Clara tools of its own: files, a shell, a calendar... whatever lives on *its*
+machine. The request of `/v1/chat/stream` takes more fields:
+
+| Field | |
+| --- | --- |
+| `tools` | tools the client runs itself, as function schemas (`{"type": "function", "function": {"name", "description", "parameters"}}`). Names must not collide with the server's (`remember`, `forget`) |
+| `instructions` | text added to the system prompt (what this client is for, how to use its tools) |
+| `prefix` | text shown to the model before the message, kept in the history but left out of summaries (e.g. the date) |
+| `ephemeral` | a one-shot job: no Clara persona, no memory, no stored history, no server tools; the system prompt is just `instructions`. Used for sub-agents |
+
+When the model calls one of the client's tools, the stream sends
+
+```
+event: tool_requests
+data: {"type": "tool_requests", "turn": "<id>", "calls": [{"id": "call_0_0", "name": "read_file", "arguments": {...}}]}
+```
+
+and waits. The client runs the tools, then posts `{"results": [{"id": "call_0_0", "content": "..."}]}` (one entry
+per call, no more, no fewer) to `/v1/turns/<id>/tool-results`; the same stream goes on with the next model round. The
+connection stays open meanwhile (a `: keepalive` comment is sent every 15 s). Only the client that opened
+the turn can answer it. Closing the stream gives the turn up; a client silent for `CLARA_TOOL_TIMEOUT` seconds
+ends it with an `error` event. A model slot is held only while the model works, never while a client does.
+`/v1/chat` (no stream) cannot carry client tools.
+
+The tool calls and their results are stored with the conversation, so the model remembers what it did; the outputs
+of all but the 8 most recent tool calls are replaced by a short note when the history is replayed.
+
+### Long conversations
+
+The `done` event reports `context: {tokens, window, percent}`. When a conversation fills `CLARA_COMPACT_PERCENT`
+of the provider's window, the server asks the model for a summary of the older messages (a `compacted` event says
+so) and from then on sends the summary instead of them; the messages stay in the database. `POST
+/v1/conversations/{id}/compact` does it on demand, with an optional focus. The summary is written once per
+compaction and is not meant to shrink conversations that are already short.
 
 ### Writing a client
 
@@ -157,7 +197,8 @@ src/clara/
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
   prompt.py     personality file + per-request context
-  agent.py      one conversation turn (locks, tools, streaming, storage)
+  agent.py      one conversation turn (locks, server and client tools, streaming, storage, compaction)
+  compaction.py transcript and summary request for long conversations
   commands.py   the console commands (/provider, /status...), shared by both consoles
   console.py    the interactive prompt (history, completion)
   server.py     FastAPI routes, auth, embedded console
@@ -168,7 +209,7 @@ config/system_prompt.md   Clara's personality, re-read when edited
 
 ## Next steps
 
-- Summaries of old history, and semantic recall of facts (embeddings).
+- Semantic recall of facts (embeddings).
 - A second LLM provider: implement `LlmBackend.stream()`.
 - Turn the existing Discord bot into a client of this server.
 - Scheduled / proactive tasks.

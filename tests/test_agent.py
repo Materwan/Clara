@@ -22,7 +22,7 @@ async def test_streams_tokens_then_done_and_stores_the_exchange(memory, tmp_path
     agent = make_agent(memory, tmp_path, FakeBackend(say("Hel", "lo!")))
     events = await run(agent, message="hi")
 
-    assert [e["type"] for e in events] == ["token", "token", "done"]
+    assert [e["type"] for e in events] == ["turn", "token", "token", "usage", "done"]
     done = events[-1]
     assert done["reply"] == "Hello!"
     assert done["conversation"] == "cli:erwan"
@@ -39,7 +39,7 @@ async def test_tools_run_and_memory_reaches_the_next_prompt(memory, tmp_path):
     agent = make_agent(memory, tmp_path, backend)
 
     first = await run(agent, message="I have a cat named Miso")
-    assert [e["type"] for e in first] == ["tool", "token", "done"]
+    assert [e["type"] for e in first] == ["turn", "usage", "tool", "token", "usage", "done"]
     assert first[-1]["tools"] == ["remember"]
 
     # Another surface, same person once linked: the fact is in the system prompt
