@@ -98,7 +98,7 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 
 | Route | |
 | --- | --- |
-| `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}` |
+| `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}`; 413 if it cannot fit the model's window, 504 if the model hangs |
 | `POST /v1/chat/stream` | same body; Server-Sent Events `turn` / `token` / `tool` / `tool_requests` / `usage` / `compacted` / `warning` / `done` / `error` |
 | `POST /v1/turns/{id}/tool-results` | `{results: [{id, content}]}`: a client's answer to a `tool_requests` event (see below) |
 | `GET /v1/conversations/{id}` | `{tokens, window, percent, summary, messages}`: how full the context is |
@@ -164,6 +164,13 @@ the previous one, so no message is skipped. The same happens when a conversation
 are summarised (half of the history is kept) instead of silently falling out of the prompt, as long
 as `CLARA_COMPACT_PERCENT` is not 0. The summary is not meant to shrink conversations that are
 already short.
+
+A prompt is never left to be truncated silently. Before each model round the server estimates its size
+(messages, tool calls and schemas, whatever the model reports): above 95% of the window it summarises the
+older turns, then leaves the oldest replayed turns out (with a `warning` event), and if it still does not fit
+the turn ends with an error: HTTP 413 on `/v1/chat`, an `error` event on the stream. A single message
+taking more than half of the window is refused at once. The context size reported to clients is the larger of
+the model's figure and the estimate, since a prompt cache can make Ollama report only what it evaluated.
 
 ### Writing a client
 

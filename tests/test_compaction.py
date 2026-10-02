@@ -146,7 +146,7 @@ async def test_with_too_few_turns_everything_is_summarised(memory, tmp_path):
 async def test_the_size_after_compaction_counts_the_kept_turns(memory, tmp_path):
     long = "x" * 3_500  # about 1000 tokens
     backend = FakeBackend(
-        say("a1", prompt_tokens=600), say("a2", prompt_tokens=1_200), say("a3", prompt_tokens=1_800),
+        say("a1", prompt_tokens=1_000), say("a2", prompt_tokens=2_000), say("a3", prompt_tokens=3_500),
         say("short summary"),
     )
     agent = make_agent(memory, tmp_path, backend, context_window=4_000, keep_recent_turns=1)
@@ -155,7 +155,7 @@ async def test_the_size_after_compaction_counts_the_kept_turns(memory, tmp_path)
 
     before, after = await agent.compact(CONVERSATION)
 
-    assert before == pytest.approx(100 * 1_803 / 4_000, abs=0.5)
+    assert before == pytest.approx(100 * 3_503 / 4_000, abs=0.5)
     kept_tokens = 1_000  # the last turn stays in the context
     assert after > 100 * kept_tokens / 4_000
     assert after < before

@@ -226,16 +226,16 @@ async def test_instructions_and_prefix(memory, tmp_path):
 
 async def test_manual_compaction_replaces_older_messages_by_a_summary(memory, tmp_path):
     backend = FakeBackend(say("a1", prompt_tokens=700), say("a2", prompt_tokens=1500), say("The user asked q1 and q2."), say("a3"))
-    agent = make_agent(memory, tmp_path, backend, context_window=2000, compact_percent=0)
+    agent = make_agent(memory, tmp_path, backend, context_window=4000, compact_percent=0)
     long = "x" * 3500  # about 1000 tokens
     await drive(agent, request(message="q1 " + long))
     await drive(agent, request(message="q2 " + long))
     full = agent.context("console:erwan")["percent"]
-    assert full == pytest.approx(75, abs=0.5)
+    assert full > 50  # the model reported less than the prompt weighs (about 2000 tokens of messages): the estimate wins
 
     before, after = await agent.compact("console:erwan", focus="the questions")
     assert before == pytest.approx(full, abs=0.1)
-    assert after < 2  # only the summary is left
+    assert after < full / 3  # only the summary and the fixed part (system prompt, tools) are left
 
     summary_call = backend.calls[2][0]
     assert "the questions" in summary_call[1]["content"] and "Erwan: q1" in summary_call[1]["content"]
@@ -258,10 +258,10 @@ async def test_compacting_an_empty_conversation_or_failing_summary(memory, tmp_p
 
 
 async def test_automatic_compaction_when_the_context_is_full(memory, tmp_path):
-    backend = FakeBackend(say("big answer", prompt_tokens=900), say("Summary."))
-    agent = make_agent(memory, tmp_path, backend, context_window=1000, compact_percent=80)
+    backend = FakeBackend(say("big answer", prompt_tokens=1700), say("Summary."))
+    agent = make_agent(memory, tmp_path, backend, context_window=2000, compact_percent=80)
 
-    events = await drive(agent, request(message="q" * 3000))  # about 850 of the 900 tokens
+    events = await drive(agent, request(message="q" * 1200))  # the model says the prompt took 1700 of 2000 tokens
 
     kinds = [e["type"] for e in events]
     assert kinds.index("compacted") < kinds.index("done")
@@ -272,8 +272,8 @@ async def test_automatic_compaction_when_the_context_is_full(memory, tmp_path):
 
 
 async def test_a_failing_automatic_compaction_is_a_warning_not_an_error(memory, tmp_path):
-    backend = FakeBackend(say("answer", prompt_tokens=90), say(""))
-    agent = make_agent(memory, tmp_path, backend, context_window=100, compact_percent=80)
+    backend = FakeBackend(say("answer", prompt_tokens=1800), say(""))
+    agent = make_agent(memory, tmp_path, backend, context_window=2000, compact_percent=80)
     events = await drive(agent, request(message="q"))
     assert [e["type"] for e in events][-2:] == ["warning", "done"]
     assert events[-1]["reply"] == "answer"

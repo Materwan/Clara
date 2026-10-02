@@ -86,14 +86,14 @@ def test_tool_results_for_an_unknown_turn(make_client):
 
 
 def test_conversation_info_and_compaction_endpoints(make_client):
-    client = make_client(say("answer", prompt_tokens=100), say("A summary."))
+    client = make_client(say("answer", prompt_tokens=5000), say("A summary."))
     empty = client.get("/v1/conversations/console:erwan", headers=CHAT).json()
     assert empty["tokens"] == 0 and empty["summary"] == "" and empty["window"] > 0
     assert client.post("/v1/conversations/console:erwan/compact", json={}, headers=CHAT).status_code == 409
 
     client.post("/v1/chat", json=BODY, headers=CHAT)
     info = client.get("/v1/conversations/console:erwan", headers=CHAT).json()
-    assert info["tokens"] == 103 and info["messages"] == 2
+    assert info["tokens"] == 5003 and info["messages"] == 2
 
     done = client.post("/v1/conversations/console:erwan/compact", json={"focus": "x"}, headers=CHAT)
     assert done.status_code == 200

@@ -44,6 +44,19 @@ def estimate_message_tokens(message: StoredMessage) -> int:
     return estimate_tokens(message.content) + estimate_tokens(message.prefix) + estimate_tokens(calls)
 
 
+def estimate_prompt_tokens(messages: list[dict], schemas: list[dict] | None = None) -> int:
+    """What a prompt weighs: the text of its messages, their tool calls and the tool schemas.
+    Local, so it also works when the model reports nothing (or less than it read, if it cached)."""
+    total = 0
+    for message in messages:
+        total += estimate_tokens(message.get("content") or "")
+        if message.get("tool_calls"):
+            total += estimate_tokens(json.dumps(message["tool_calls"], ensure_ascii=False, default=str))
+    if schemas:
+        total += estimate_tokens(json.dumps(schemas, ensure_ascii=False, default=str))
+    return total
+
+
 def transcript_budget(window: int) -> int:
     """How many characters of transcript one summary request may carry for a model window."""
     return max(MIN_TRANSCRIPT_CHARS, min(MAX_TRANSCRIPT_CHARS, int(window * CHARS_PER_TOKEN * 0.4)))

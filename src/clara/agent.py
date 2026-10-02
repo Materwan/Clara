@@ -29,6 +29,7 @@ from .compaction import (
     build_transcript,
     chunk_messages,
     estimate_message_tokens,
+    estimate_prompt_tokens,
     estimate_tokens,
     summary_request,
     transcript_budget,
@@ -45,6 +46,8 @@ MAX_FACTS_IN_PROMPT = 100
 RECENT_TOOL_RESULTS_KEPT = 8  # older tool outputs are replaced by a note, to save context
 OMITTED = "[output omitted to save context]"
 DEFAULT_CONTEXT_WINDOW = 32_768
+PROMPT_LIMIT = 0.95  # share of the window a prompt may fill; beyond, the model would truncate it silently
+MAX_MESSAGE_SHARE = 0.5  # share of the window a single new message may take
 
 
 def now_in(timezone: str | None) -> datetime:
@@ -62,6 +65,10 @@ class ClientToolTimeout(Exception):
 
 class ModelTimeout(Exception):
     """The model stopped answering."""
+
+
+class PromptTooLarge(Exception):
+    """What must be sent to the model does not fit in its context window."""
 
 
 async def with_idle_timeout(
@@ -285,6 +292,12 @@ class Agent:
 
     async def _turn(self, request: ChatRequest, owner: str) -> AsyncIterator[dict]:
         self.validate(request)
+        new_tokens = estimate_tokens(request.message) + estimate_tokens(request.prefix)
+        if new_tokens > MAX_MESSAGE_SHARE * self.window:
+            raise PromptTooLarge(
+                f"This message is too long for the model: about {new_tokens:,} tokens, and at most "
+                f"{int(MAX_MESSAGE_SHARE * self.window):,} fit (the context window is {self.window:,})."
+            )
         person = self.memory.resolve(request.surface, request.user_id, request.user_name)
         conversation = request.conversation_id
         ephemeral = request.ephemeral
@@ -317,6 +330,10 @@ class Agent:
 
             for round_number in range(self.max_tool_rounds + 1):
                 offer_tools = round_number < self.max_tool_rounds  # the last round must answer
+                async for event in self._fit(
+                    request, person, messages, schemas if offer_tools else None, compact=round_number == 0
+                ):
+                    yield event
                 text_parts: list[str] = []
                 calls = []
                 round_prompt = round_completion = 0
@@ -331,9 +348,13 @@ class Agent:
                             yield {"type": "token", "text": chunk.text}
                 prompt_tokens += round_prompt
                 completion_tokens += round_completion
-                context_tokens = round_prompt + round_completion or context_tokens
-                yield {"type": "usage", "prompt_tokens": round_prompt, "completion_tokens": round_completion}
                 text = "".join(text_parts)
+                reported = round_prompt + round_completion
+                estimated = estimate_prompt_tokens(messages, schemas if offer_tools else None) + estimate_tokens(text)
+                log.debug("context of %s: model reported %d tokens, estimated %d", conversation, reported, estimated)
+                # With a prompt cache the model may report only what it evaluated this time
+                context_tokens = max(reported, estimated)
+                yield {"type": "usage", "prompt_tokens": round_prompt, "completion_tokens": round_completion}
                 reply_parts.append(text)
 
                 if not (offer_tools and calls):
@@ -430,6 +451,55 @@ class Agent:
             producer.cancel()  # the consumer left (or failed): stop reading, free the slot
             with contextlib.suppress(BaseException):
                 await producer
+
+    async def _fit(
+        self, request: ChatRequest, person: Person, messages: list[dict], schemas: list[dict] | None, compact: bool
+    ) -> AsyncIterator[dict]:
+        """Make the prompt fit in the window before it is sent, editing `messages` in place:
+        summarise the older turns (`compact`, only possible before this turn's own messages exist),
+        else leave the oldest replayed turns out; if it still does not fit, PromptTooLarge."""
+        conversation = request.conversation_id
+        limit = int(PROMPT_LIMIT * self.window)
+        size = estimate_prompt_tokens(messages, schemas)
+        if size <= limit:
+            return
+        if compact and not request.ephemeral:
+            for keep in dict.fromkeys((self.keep_recent_turns, 0)):  # the recent turns first, then all
+                try:
+                    before, after = await self._compact_locked(conversation, keep_recent_turns=keep)
+                except NothingToCompact:
+                    break
+                except Exception as error:
+                    log.warning("compaction of %s to fit the context failed: %s", conversation, error)
+                    yield {"type": "warning", "message": f"Could not compact the conversation: {error}"}
+                    break
+                yield {"type": "compacted", "before": before, "after": after}
+                messages[:] = self._build_messages(request, person, self.memory.state(conversation))
+                size = estimate_prompt_tokens(messages, schemas)
+                if size <= limit:
+                    return
+        dropped = False
+        while size > limit and self._drop_oldest_turn(messages):
+            dropped = True
+            size = estimate_prompt_tokens(messages, schemas)
+        if dropped:
+            yield {"type": "warning", "message": "Older messages were left out of the prompt to fit the context."}
+        if size > limit:
+            raise PromptTooLarge(
+                f"The prompt needs about {size:,} tokens but the model's context window is {self.window:,}: "
+                "a message, a tool result or the instructions are too large."
+            )
+
+    @staticmethod
+    def _drop_oldest_turn(messages: list[dict]) -> bool:
+        """Remove the oldest replayed turn (the system prompt and the newest user message stay)."""
+        newest = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
+        first = 1 if messages and messages[0]["role"] == "system" else 0
+        if newest <= first:
+            return False  # no history left
+        end = next((i for i in range(first + 1, newest) if messages[i]["role"] == "user"), newest)
+        del messages[first:end]
+        return True
 
     def _history_overflows(self, conversation: str, state: ConversationState) -> bool:
         """Are there more turns waiting than the prompt takes back (`history_turns`)?"""
