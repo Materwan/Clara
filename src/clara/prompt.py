@@ -44,6 +44,7 @@ class SystemPrompt:
         today: datetime,
         instructions: str = "",
         summary: str = "",
+        omitted_facts: int = 0,
     ) -> str:
         """The system prompt. `instructions` come from the client (what it is for, how to use
         its tools); `summary` replaces the older part of a long conversation. Only the date
@@ -52,6 +53,8 @@ class SystemPrompt:
             known = "\n".join(f"- [{fact.id}] {fact.text}" for fact in facts)
         else:
             known = "(nothing yet)"
+        if omitted_facts:
+            known += f"\n[{omitted_facts} older facts not shown, use recall_facts]"
         parts = [
             f"{self.personality()}\n\n"
             "## Current context\n"

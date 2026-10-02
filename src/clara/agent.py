@@ -35,7 +35,7 @@ from .compaction import (
     transcript_budget,
 )
 from .llm import LlmBackend, LlmChunk
-from .memory import ConversationState, Memory, Person, StoredMessage, TurnRow
+from .memory import ConversationState, Fact, Memory, Person, StoredMessage, TurnRow
 from .prompt import SystemPrompt
 from .tools import Toolbox, ToolContext
 
@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 40
 MAX_FACTS_IN_PROMPT = 100
+DEFAULT_FACTS_TOKEN_BUDGET = 2_000
 RECENT_TOOL_RESULTS_KEPT = 8  # older tool outputs are replaced by a note, to save context
 OMITTED = "[output omitted to save context]"
 DEFAULT_CONTEXT_WINDOW = 32_768
@@ -137,6 +138,7 @@ class Agent:
         context_window: int | Callable[[], int] = DEFAULT_CONTEXT_WINDOW,
         compact_percent: int = 80,
         keep_recent_turns: int = 2,
+        facts_token_budget: int = DEFAULT_FACTS_TOKEN_BUDGET,
         transcript_chars: int | None = None,
         tool_timeout: float = 900.0,
         first_token_timeout: float = 300.0,
@@ -151,6 +153,7 @@ class Agent:
         self.max_tool_rounds = max_tool_rounds
         self.compact_percent = compact_percent
         self.keep_recent_turns = keep_recent_turns  # turns a compaction leaves as they are
+        self.facts_token_budget = facts_token_budget  # tokens of facts shown in the system prompt
         self._transcript_chars = transcript_chars  # characters per summary request (default: from the window)
         self.tool_timeout = tool_timeout
         self.first_token_timeout = first_token_timeout  # seconds before the model starts answering
@@ -245,6 +248,19 @@ class Agent:
                 messages.append({"role": "tool", "tool_name": message.tool_name, "content": content})
         return messages
 
+    def _facts_for_prompt(self, person: Person) -> tuple[list[Fact], int]:
+        """The newest facts that fit the token budget (oldest first), and how many were left out."""
+        shown: list[Fact] = []
+        used = 0
+        for fact in reversed(self.memory.facts(person.id, MAX_FACTS_IN_PROMPT)):  # newest first
+            cost = estimate_tokens(f"- [{fact.id}] {fact.text}") + 1
+            if used + cost > self.facts_token_budget:
+                break
+            shown.append(fact)
+            used += cost
+        shown.reverse()
+        return shown, max(0, self.memory.fact_count(person.id) - len(shown))
+
     def _build_messages(self, request: ChatRequest, person: Person, state: ConversationState) -> list[dict]:
         messages: list[dict] = []
         now = self._clock(request.timezone)
@@ -252,9 +268,9 @@ class Agent:
             if request.instructions.strip():
                 messages.append({"role": "system", "content": request.instructions.strip()})
         else:
-            facts = self.memory.facts(person.id, MAX_FACTS_IN_PROMPT)
+            facts, omitted = self._facts_for_prompt(person)
             system = self.prompt.render(
-                person, request.surface, facts, now, request.instructions, state.summary,
+                person, request.surface, facts, now, request.instructions, state.summary, omitted,
             )
             messages.append({"role": "system", "content": system})
             stored = self.memory.history(request.conversation_id, self.history_turns, state.upto_id)

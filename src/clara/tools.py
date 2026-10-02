@@ -18,6 +18,8 @@ from .memory import Memory, Person
 
 log = logging.getLogger(__name__)
 
+RECALL_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -89,6 +91,13 @@ def _forget(context: ToolContext, fact_id: Any) -> str:
     return "No such fact for this person."
 
 
+def _recall_facts(context: ToolContext, query: str) -> str:
+    found = context.memory.search_facts(context.person.id, str(query), RECALL_LIMIT)
+    if not found:
+        return "No matching fact."
+    return "\n".join(f"[{fact.id}] {fact.text}" for fact in found)
+
+
 def default_toolbox() -> Toolbox:
     return Toolbox(
         [
@@ -108,6 +117,16 @@ def default_toolbox() -> Toolbox:
                 function=_forget,
                 parameters={"fact_id": {"type": "integer", "description": "Id of the fact."}},
                 required=("fact_id",),
+            ),
+            Tool(
+                name="recall_facts",
+                description=(
+                    "Search the remembered facts of this person for words (any case), when the facts "
+                    "shown to you say that older ones are not shown. Returns up to 10 facts, newest first."
+                ),
+                function=_recall_facts,
+                parameters={"query": {"type": "string", "description": "Words to look for."}},
+                required=("query",),
             ),
         ]
     )

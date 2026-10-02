@@ -89,8 +89,11 @@ account to attach asks its own client for a code (`POST /v1/accounts/link-code`,
 if at most one of the two already has memories: merging two filled accounts cannot be undone, so
 an operator does it from the server console (`/link`).
 
-The model saves and removes facts itself through two tools, `remember` and
-`forget`, which can only touch the person who is talking.
+The model saves and removes facts itself through three tools, `remember`, `forget` and
+`recall_facts`, which can only touch the person who is talking. The prompt shows the newest facts that fit
+`CLARA_FACTS_TOKEN_BUDGET` tokens (2000) and says how many older ones are left out; `recall_facts` searches
+those by words (any case, any accent: "Élan" and "élan" are one fact). Duplicates are detected on the folded
+text (Unicode NFKC + case folding + spaces), and databases from earlier versions are migrated at startup.
 
 ## API
 

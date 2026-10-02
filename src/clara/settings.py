@@ -109,6 +109,7 @@ class Settings:
     llm_idle_timeout: int  # seconds the model may pause between two pieces of its answer
     compact_percent: int  # summarise a conversation when its context is this full (0 = never)
     keep_recent_turns: int  # turns a compaction leaves unsummarised
+    facts_token_budget: int  # tokens of remembered facts shown to the model in each prompt
     system_prompt_file: Path
     # Language model providers (see providers.py)
     default_provider: str
@@ -180,6 +181,7 @@ class Settings:
             llm_idle_timeout=_positive_int(env, "CLARA_LLM_IDLE_TIMEOUT", 120),
             compact_percent=_non_negative_int(env, "CLARA_COMPACT_PERCENT", 80),
             keep_recent_turns=_non_negative_int(env, "CLARA_KEEP_RECENT_TURNS", 2),
+            facts_token_budget=_positive_int(env, "CLARA_FACTS_TOKEN_BUDGET", 2000),
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),
             default_provider=default_provider,
             local_host=text("OLLAMA_HOST", DEFAULT_LOCAL_HOST),

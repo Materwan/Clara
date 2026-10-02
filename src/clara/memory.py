@@ -2,7 +2,8 @@
 
     people(id, name)                        one row per real person
     accounts(surface, external_id, person)  "discord:1234" and "cli:erwan" can be the same person
-    facts(id, person, text)                 what Clara knows about a person (shared by every surface)
+    facts(id, person, text, text_key)       what Clara knows about a person (shared by every surface);
+                                            text_key is the text folded for comparison (no duplicates)
     messages(id, conversation, person, role, content)
                                             conversation history, one thread per conversation id
 
@@ -20,6 +21,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,9 +46,9 @@ CREATE TABLE IF NOT EXISTS facts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id  INTEGER NOT NULL REFERENCES people (id),
     text       TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    text_key   TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_unique ON facts (person_id, lower(text));
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation TEXT NOT NULL,
@@ -135,6 +137,12 @@ def _one_line(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def fact_key(text: str) -> str:
+    """A fact folded for comparison: "Élan " and "élan" are the same fact (SQLite's lower() only
+    knows ASCII)."""
+    return " ".join(unicodedata.normalize("NFKC", text or "").casefold().split())
+
+
 class Memory:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +156,22 @@ class Memory:
         for column, definition in _ADDED_COLUMNS.items():
             if column not in present:
                 self._db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+        self._migrate_fact_keys()
         self._db.commit()
+
+    def _migrate_fact_keys(self) -> None:
+        """Databases from before `text_key` compared facts with SQL lower(): give every fact its key,
+        drop the duplicates that only differed by non-ASCII case (the oldest stays), then index."""
+        db = self._db
+        if "text_key" not in {row["name"] for row in db.execute("PRAGMA table_info(facts)")}:
+            db.execute("ALTER TABLE facts ADD COLUMN text_key TEXT NOT NULL DEFAULT ''")
+        db.execute("DROP INDEX IF EXISTS idx_facts_unique")  # the old index, on lower(text)
+        for row in db.execute("SELECT id, text FROM facts WHERE text_key = ''").fetchall():
+            db.execute("UPDATE facts SET text_key = ? WHERE id = ?", (fact_key(row["text"]), row["id"]))
+        db.execute(
+            "DELETE FROM facts WHERE id NOT IN (SELECT MIN(id) FROM facts GROUP BY person_id, text_key)"
+        )
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_key ON facts (person_id, text_key)")
 
     def close(self) -> None:
         with self._lock:
@@ -293,10 +316,30 @@ class Memory:
             raise ValueError(f"A fact is at most {MAX_FACT_LENGTH} characters long.")
         with self._lock, self._db:
             cursor = self._db.execute(
-                "INSERT OR IGNORE INTO facts (person_id, text, created_at) VALUES (?, ?, ?)",
-                (person_id, text, _now()),
+                "INSERT OR IGNORE INTO facts (person_id, text, text_key, created_at) VALUES (?, ?, ?, ?)",
+                (person_id, text, fact_key(text), _now()),
             )
             return Fact(cursor.lastrowid, text) if cursor.rowcount else None
+
+    def fact_count(self, person_id: int) -> int:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM facts WHERE person_id = ?", (person_id,)
+            ).fetchone()[0]
+
+    def search_facts(self, person_id: int, query: str, limit: int = 10) -> list[Fact]:
+        """The person's facts containing every word of `query` (any case), newest first.
+        Only that person's: the search is always scoped by `person_id`."""
+        terms = fact_key(query).split()
+        if not terms:
+            return []
+        where = " AND ".join("instr(text_key, ?) > 0" for _ in terms)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT id, text FROM facts WHERE person_id = ? AND {where} ORDER BY id DESC LIMIT ?",
+                (person_id, *terms, limit),
+            ).fetchall()
+        return [Fact(row["id"], row["text"]) for row in rows]
 
     def delete_fact(self, person_id: int, fact_id: int) -> bool:
         """Delete one of the person's facts (never someone else's)."""
