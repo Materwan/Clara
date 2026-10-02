@@ -294,6 +294,30 @@ async def facts_command(ctx: CommandContext, args: str) -> str:
 
 
 @registry.command(
+    "forget-person",
+    "<person> [confirm]",
+    "Erase a person: accounts, facts and what they said (shows what would go until you confirm)",
+)
+async def forget_person_command(ctx: CommandContext, args: str) -> str:
+    reference, _, last = args.strip().rpartition(" ")
+    confirmed = last.lower() == "confirm"
+    person = find_person(ctx.memory, reference if confirmed else args)
+    found = ctx.memory.footprint(person.id)
+    summary = (
+        f"{person.name} (id {person.id}): {found.accounts} accounts, {found.facts} facts, "
+        f"{found.messages} messages in {found.conversations} conversations"
+    )
+    if not confirmed:
+        return (
+            f"This would erase {summary}.\nIn a conversation shared with other people only their own "
+            f"messages go.\nThere is no undo; to proceed: /forget-person {person.id} confirm"
+        )
+    ctx.memory.delete_person(person.id)
+    log.info("erased person %s (id %s)", person.name, person.id)
+    return f"Erased {summary}."
+
+
+@registry.command(
     "link",
     "<surface:user> <person>",
     "Make an account belong to a person (merges them if it already has its own)",

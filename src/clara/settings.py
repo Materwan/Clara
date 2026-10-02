@@ -80,6 +80,15 @@ DEFAULT_CLOUD_HOST = "https://ollama.com"
 PROVIDER_IDS = ("local", "cloud")
 
 
+def _flag(env: Mapping[str, str], key: str) -> bool:
+    raw = env.get(key, "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    raise SettingsError(f"{key} must be true or false, got {raw!r}")
+
+
 def _non_negative_int(env: Mapping[str, str], key: str, default: int) -> int:
     raw = env.get(key, "").strip()
     if not raw:
@@ -111,6 +120,7 @@ class Settings:
     compact_percent: int  # summarise a conversation when its context is this full (0 = never)
     keep_recent_turns: int  # turns a compaction leaves unsummarised
     facts_token_budget: int  # tokens of remembered facts shown to the model in each prompt
+    purge_summarised: bool  # delete messages once a summary stands for them
     system_prompt_file: Path
     # Language model providers (see providers.py)
     default_provider: str
@@ -189,6 +199,7 @@ class Settings:
             compact_percent=_non_negative_int(env, "CLARA_COMPACT_PERCENT", 80),
             keep_recent_turns=_non_negative_int(env, "CLARA_KEEP_RECENT_TURNS", 2),
             facts_token_budget=_positive_int(env, "CLARA_FACTS_TOKEN_BUDGET", 2000),
+            purge_summarised=_flag(env, "CLARA_PURGE_SUMMARISED"),
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),
             default_provider=default_provider,
             local_host=text("OLLAMA_HOST", DEFAULT_LOCAL_HOST),

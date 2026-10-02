@@ -95,6 +95,16 @@ class PersonSummary:
 
 
 @dataclass(frozen=True)
+class Footprint:
+    """What Clara holds about a person (and what `delete_person` removes)."""
+
+    accounts: int
+    facts: int
+    messages: int  # their own messages, plus the whole of the conversations they were alone in
+    conversations: int
+
+
+@dataclass(frozen=True)
 class Fact:
     id: int
     text: str
@@ -286,6 +296,60 @@ class Memory:
                     )
                 self._merge(current.id, target.id)
         return target
+
+    def _conversations_of(self, person_id: int) -> tuple[list[str], list[str]]:
+        """(conversations only this person wrote in, conversations shared with someone else)."""
+        alone: list[str] = []
+        shared: list[str] = []
+        for row in self._db.execute(
+            "SELECT DISTINCT conversation FROM messages WHERE person_id = ?", (person_id,)
+        ).fetchall():
+            others = self._db.execute(
+                "SELECT 1 FROM messages WHERE conversation = ? AND role = 'user' AND person_id IS NOT ?"
+                " LIMIT 1",
+                (row["conversation"], person_id),
+            ).fetchone()
+            (shared if others else alone).append(row["conversation"])
+        return alone, shared
+
+    def footprint(self, person_id: int) -> Footprint:
+        with self._lock:
+            alone, shared = self._conversations_of(person_id)
+            messages = sum(
+                self._db.execute("SELECT COUNT(*) FROM messages WHERE conversation = ?", (c,)).fetchone()[0]
+                for c in alone
+            ) + sum(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE conversation = ? AND person_id = ?", (c, person_id)
+                ).fetchone()[0]
+                for c in shared
+            )
+            return Footprint(
+                len(self.accounts_of(person_id)), self.fact_count(person_id), messages, len(alone) + len(shared)
+            )
+
+    def delete_person(self, person_id: int) -> Footprint:
+        """Erase a person: accounts, facts and what they said. A conversation only they wrote in goes
+        entirely (answers and summary included); in one shared with other people only their own
+        messages go, and the answers and summary that remain may still mention them."""
+        with self._lock, self._db:
+            found = self.footprint(person_id)
+            alone, shared = self._conversations_of(person_id)
+            for conversation in alone:
+                self._db.execute("DELETE FROM messages WHERE conversation = ?", (conversation,))
+                self._db.execute("DELETE FROM conversation_state WHERE conversation = ?", (conversation,))
+            self._db.execute("DELETE FROM messages WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM facts WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM accounts WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM people WHERE id = ?", (person_id,))
+            return found
+
+    def purge_summarised(self, conversation: str, upto_id: int) -> int:
+        """Delete the messages a summary stands for (it then is the only record of them)."""
+        with self._lock, self._db:
+            return self._db.execute(
+                "DELETE FROM messages WHERE conversation = ? AND id <= ?", (conversation, upto_id)
+            ).rowcount
 
     def _merge(self, source: int, target: int) -> None:
         db = self._db

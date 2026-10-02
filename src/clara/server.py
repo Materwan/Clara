@@ -230,6 +230,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         compact_percent=settings.compact_percent,
         keep_recent_turns=settings.keep_recent_turns,
         facts_token_budget=settings.facts_token_budget,
+        purge_summarised=settings.purge_summarised,
         tool_timeout=settings.tool_timeout,
         first_token_timeout=settings.llm_first_token_timeout,
         idle_timeout=settings.llm_idle_timeout,

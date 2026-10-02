@@ -140,6 +140,7 @@ class Agent:
         compact_percent: int = 80,
         keep_recent_turns: int = 2,
         facts_token_budget: int = DEFAULT_FACTS_TOKEN_BUDGET,
+        purge_summarised: bool = False,
         transcript_chars: int | None = None,
         tool_timeout: float = 900.0,
         first_token_timeout: float = 300.0,
@@ -155,6 +156,7 @@ class Agent:
         self.compact_percent = compact_percent
         self.keep_recent_turns = keep_recent_turns  # turns a compaction leaves as they are
         self.facts_token_budget = facts_token_budget  # tokens of facts shown in the system prompt
+        self.purge_summarised = purge_summarised  # delete messages once a summary stands for them
         self._transcript_chars = transcript_chars  # characters per summary request (default: from the window)
         self.tool_timeout = tool_timeout
         self.first_token_timeout = first_token_timeout  # seconds before the model starts answering
@@ -601,6 +603,8 @@ class Agent:
         fixed = max(0, state.context_tokens - measured)
         after_tokens = fixed + estimate_tokens(summary) + sum(estimate_message_tokens(row) for row in kept)
         self.memory.set_summary(conversation, summary, old[-1].id, after_tokens)
+        if self.purge_summarised:
+            self.memory.purge_summarised(conversation, old[-1].id)
         window = self.window
         return 100 * state.context_tokens / window, 100 * after_tokens / window
 

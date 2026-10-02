@@ -55,6 +55,7 @@ Both consoles run the same commands (the `/` is optional):
 | `/status` | provider, model, uptime, running turns, tokens, memory size |
 | `/people` | everybody Clara knows, with accounts and fact counts |
 | `/facts <person> [add <text>\|del <id>]` | read or edit what Clara knows (person = id, `surface:user` or name) |
+| `/forget-person <person> [confirm]` | erase a person: accounts, facts and what they said (without `confirm`, only shows what would go) |
 | `/link <surface:user> <person>` | make an account belong to a person (merges them) |
 | `/help [command]`, `/quit` | `/quit` stops the server from the embedded console, and only closes a remote one |
 
@@ -159,6 +160,14 @@ of all but the 8 most recent tool calls are replaced by a short note when the hi
 The system prompt only holds the date, and the time of day is added to the newest user message (not
 stored), so the prompt and the replayed history stay identical from one turn to the next and Ollama can
 reuse its cache of them.
+
+### Privacy
+
+`/forget-person <person> confirm` erases a person: their accounts, facts and messages. A conversation only they
+took part in goes entirely, answers and summary included. In a conversation shared with other people only their own
+messages go, and the answers and summary that remain may still mention them. Messages are kept after a compaction
+(the summary stands for them) unless `CLARA_PURGE_SUMMARISED=true`, which deletes them: the summary, which can
+contain personal data too, is then the only record. There is no retention limit otherwise.
 
 ### Long conversations
 
