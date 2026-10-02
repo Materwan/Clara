@@ -1,0 +1,22 @@
+# Install:
+#   sudo cp deploy/clara.service /etc/systemd/system/clara.service
+#   (edit User and the paths below)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now clara
+# Logs: journalctl -u clara -f
+[Unit]
+Description=Clara AI server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clara
+WorkingDirectory=/opt/clara
+# Holds CLARA_TOKENS, CLARA_MODEL, CLARA_DATA_DIR... (see .env.example)
+EnvironmentFile=/opt/clara/.env
+ExecStart=/opt/clara/.venv/bin/clara-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
