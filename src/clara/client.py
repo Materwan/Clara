@@ -10,7 +10,11 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Iterator
 
 import httpx
@@ -27,8 +31,16 @@ HELP = """\
 /link <surface> <id> <code>
                   tell Clara that account (e.g. discord 1234) is you too; <code> is
                   the one that account's own client gave it with its /linkcode
+/remind [daily|weekly|monthly] <when> <text>
+                  a notification on EVERY connected Clara client at that time.
+                  <when>: +30m, +2h, +3d | 09:30 | tomorrow 09:30 | 2026-10-05 09:30
+/reminders        your reminders that have not fired yet
+/unremind <id>    cancel one of them
 /new              start a fresh conversation thread (facts are kept)
 /quit             leave"""
+
+REPEATS = ("daily", "weekly", "monthly")
+LATE_SECONDS = 120  # a reminder shown this long after it fired is announced as missed
 
 
 class ClaraApi:
@@ -95,6 +107,170 @@ class ClaraApi:
     def new_thread(self) -> None:
         self.http.delete(f"/v1/conversations/{self.conversation}").raise_for_status()
 
+    def add_reminder(self, at: datetime, text: str, repeat: str) -> dict:
+        response = self.http.post(
+            "/v1/reminders",
+            json={
+                **self.identity(),
+                "user_name": self.name,
+                "text": text,
+                "repeat": repeat,
+                "at": at.isoformat(timespec="seconds"),
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def reminders(self) -> list[dict]:
+        response = self.http.get("/v1/reminders", params=self.identity())
+        response.raise_for_status()
+        return response.json()["reminders"]
+
+    def cancel_reminder(self, reminder_id: int) -> None:
+        self.http.delete(f"/v1/reminders/{reminder_id}", params=self.identity()).raise_for_status()
+
+    def reminder_events(self) -> Iterator[dict]:
+        """What the server announces, for as long as the connection holds: `reminder` events (the ones
+        missed while away first) and `server` events (its state: running, stopping, stopped). It has its
+        own connection, so a background thread can run it."""
+        with (
+            httpx.Client(
+                base_url=str(self.http.base_url),
+                headers=self.http.headers,
+                timeout=httpx.Timeout(10.0, read=60.0),  # the server sends a keepalive every 15 s
+            ) as http,
+            http.stream("GET", "/v1/reminders/stream") as response,
+        ):
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    event = json.loads(line[6:])
+                    if event.get("type") in ("reminder", "server"):
+                        yield event
+
+
+def _clock(text: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d{1,2}):(\d\d)", text)
+    if not match or int(match[1]) > 23 or int(match[2]) > 59:
+        raise ValueError(f"Not a time of day: {text!r} (use HH:MM).")
+    return int(match[1]), int(match[2])
+
+
+def parse_remind(argument: str, now: datetime) -> tuple[datetime, str, str]:
+    """`(when, repeat, text)` from the arguments of /remind. `now` is the local time, with its offset."""
+    words = argument.split()
+    repeat = words.pop(0).lower() if words and words[0].lower() in REPEATS else ""
+    if not words:
+        raise ValueError("Usage: /remind [daily|weekly|monthly] <when> <text>   (see /help)")
+    head = words[0].lower()
+    relative = re.fullmatch(r"\+(\d+)([mhd])", head)
+    if relative:
+        unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
+        due, rest = now + timedelta(**{unit: int(relative[1])}), words[1:]
+    elif head == "tomorrow" and len(words) > 1:
+        hour, minute = _clock(words[1])
+        due = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        rest = words[2:]
+    elif re.fullmatch(r"\d{4}-\d\d-\d\d", head) and len(words) > 1:
+        hour, minute = _clock(words[1])
+        try:
+            due = datetime.fromisoformat(head).replace(hour=hour, minute=minute).astimezone()
+        except ValueError:
+            raise ValueError(f"Not a date: {head!r}.") from None
+        rest = words[2:]
+    elif ":" in head:
+        hour, minute = _clock(head)
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        due, rest = (due if due > now else due + timedelta(days=1)), words[1:]
+    else:
+        raise ValueError(f"Cannot read the time {head!r}: use +30m, 09:30, tomorrow 09:30 or 2026-10-05 09:30.")
+    text = " ".join(rest)
+    if not text:
+        raise ValueError("A reminder needs a text.")
+    return due, repeat, text
+
+
+def local(moment: str) -> str:
+    return datetime.fromisoformat(moment).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def describe_reminder(reminder: dict) -> str:
+    again = f" ({reminder['repeat']})" if reminder["repeat"] else ""
+    return f"[{reminder['id']}] {local(reminder['due_at'])}{again}  {reminder['text']}"
+
+
+def format_reminder(event: dict, now: datetime) -> str:
+    missed = (now - datetime.fromisoformat(event["fired_at"])).total_seconds() > LATE_SECONDS
+    late = f"  (missed, it was due {local(event['due_at'])})" if missed else ""
+    author = f"  (set by {event['from']})" if event.get("from") else ""
+    return f"\a⏰ {event.get('message') or event['text']}{late}{author}"
+
+
+class Notices:
+    """Shows reminders from the listener thread, never in the middle of a reply being printed."""
+
+    def __init__(self, prompt: str = "\nyou> "):
+        self.prompt = prompt
+        self._lock = threading.Lock()
+        self._busy = False
+        self._waiting: list[str] = []
+
+    def show(self, event: dict) -> None:
+        self.say(format_reminder(event, datetime.now().astimezone()))
+
+    def say(self, text: str) -> None:
+        with self._lock:
+            if self._busy:
+                self._waiting.append(text)
+            else:
+                print(f"\n{text}\n{self.prompt}", end="", flush=True)
+
+    @contextmanager
+    def busy(self) -> Iterator[None]:
+        """While the block runs (a reply streaming in), reminders wait."""
+        with self._lock:
+            self._busy = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._busy = False
+                waiting, self._waiting = self._waiting, []
+            for text in waiting:
+                print(f"\n{text}")
+
+
+SERVER_SAYS = {
+    "stopping": "Clara is stopping: she finishes what is running and takes nothing new.",
+    "down": "Clara is not running.",
+    "again": "Clara is running again.",
+}
+
+
+def listen(api: ClaraApi, notices: Notices, stop: threading.Event, pause: float = 5.0) -> None:
+    """Show every reminder the server announces, and say when the server stops, is gone or is back;
+    when the connection drops, try again."""
+    state = ""  # "running", "stopping" or "down"; "" before the first answer
+
+    def change(new: str) -> None:
+        nonlocal state
+        old, state = state, new
+        if new == old or (new == "running" and old == ""):
+            return
+        notices.say(SERVER_SAYS["again" if new == "running" else new])
+
+    while not stop.is_set():
+        try:
+            for event in api.reminder_events():
+                if event["type"] == "server":
+                    change({"stopped": "down"}.get(event["state"], event["state"]))
+                else:
+                    notices.show(event)
+        except (httpx.HTTPError, OSError, ValueError):
+            pass  # server down or restarting: what was missed meanwhile arrives on reconnection
+        change("down")
+        stop.wait(pause)
+
 
 def chat(api: ClaraApi, message: str) -> None:
     for event in api.stream_chat(message):
@@ -126,6 +302,19 @@ def command(api: ClaraApi, line: str) -> bool:
     elif name == "/link" and len(argument.split()) == 3:
         surface, external_id, code = argument.split()
         print("Accounts: " + ", ".join(api.link(surface, external_id, code)))
+    elif name == "/remind":
+        try:
+            due, repeat, text = parse_remind(argument, datetime.now().astimezone())
+        except ValueError as error:
+            print(error)
+            return True
+        reminder = api.add_reminder(due, text, repeat)
+        print(f"Reminder {reminder['id']} set for {local(reminder['due_at'])}: every connected client will see it.")
+    elif name == "/reminders":
+        print("\n".join(describe_reminder(r) for r in api.reminders()) or "(none)")
+    elif name == "/unremind" and argument.isdigit():
+        api.cancel_reminder(int(argument))
+        print("Cancelled.")
     elif name == "/new":
         api.new_thread()
         print("New thread.")
@@ -169,14 +358,23 @@ def main() -> None:
         handle(" ".join(args.message))
         return
     print("Clara — /help for commands, Ctrl+D to leave.")
-    while True:
-        try:
-            line = input("\nyou> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if line and not handle(line):
-            return
+    notices = Notices()
+    stop = threading.Event()
+    threading.Thread(target=listen, args=(api, notices, stop), daemon=True, name="reminders").start()
+    try:
+        while True:
+            try:
+                line = input("\nyou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if line:
+                with notices.busy():
+                    leave = not handle(line)
+                if leave:
+                    return
+    finally:
+        stop.set()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,9 @@
                                             text_key is the text folded for comparison (no duplicates)
     messages(id, conversation, person, role, content)
                                             conversation history, one thread per conversation id
+    reminders(id, person, text, due_at, ...)    what is still to be announced (see reminders.py)
+    reminder_events(id, person, text, ...)      what was announced; every client reads them in order
+    reminder_cursors(client, last_event_id)     how far each client has read
 
 Facts follow the *person*, history follows the *conversation*: Clara knows you
 are the same human on every surface, but a Discord channel and a terminal
@@ -67,13 +70,43 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     upto_id        INTEGER NOT NULL DEFAULT 0,
     context_tokens INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS reminders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id  INTEGER NOT NULL REFERENCES people (id),
+    text       TEXT NOT NULL,
+    due_at     TEXT NOT NULL,
+    anchor_at  TEXT NOT NULL,
+    repeat     TEXT NOT NULL DEFAULT '',
+    timezone   TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (due_at);
+CREATE TABLE IF NOT EXISTS reminder_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER REFERENCES people (id),
+    text      TEXT NOT NULL,
+    due_at    TEXT NOT NULL,
+    fired_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reminder_cursors (
+    client        TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL
+);
 """
 
 # Columns added after the first release: databases created before have to get them.
 _ADDED_COLUMNS = {
-    "prefix": "TEXT NOT NULL DEFAULT ''",
-    "tool_calls": "TEXT",
-    "tool_name": "TEXT",
+    "messages": {
+        "prefix": "TEXT NOT NULL DEFAULT ''",
+        "tool_calls": "TEXT",
+        "tool_name": "TEXT",
+    },
+    "reminders": {  # where the reminder was set: the answer that announces it is written there
+        "surface": "TEXT NOT NULL DEFAULT ''",
+        "user_id": "TEXT NOT NULL DEFAULT ''",
+        "conversation": "TEXT NOT NULL DEFAULT ''",
+    },
+    "reminder_events": {"message": "TEXT"},  # what Clara wrote for it (NULL: just the text)
 }
 
 
@@ -133,6 +166,32 @@ class TurnRow:
 
 
 @dataclass(frozen=True)
+class Reminder:
+    id: int
+    person_id: int
+    text: str
+    due_at: datetime  # next time it fires (UTC)
+    anchor_at: datetime  # first time it fired or will fire (UTC): repeats are counted from here
+    repeat: str  # "", "daily", "weekly" or "monthly"
+    timezone: str  # IANA name or "+02:00": the clock a repeat keeps
+    surface: str = ""  # where it was set, "" if unknown (reminders from before this was kept)
+    user_id: str = ""
+    conversation: str = ""
+
+
+@dataclass(frozen=True)
+class ReminderEvent:
+    """A reminder that came due. Kept for a while so that a client offline at that moment gets it later."""
+
+    id: int
+    text: str
+    due_at: str  # ISO, UTC
+    fired_at: str  # ISO, UTC
+    author: str | None  # name of the person who set it
+    message: str | None = None  # what Clara wrote to announce it; None: only `text` is shown
+
+
+@dataclass(frozen=True)
 class ConversationState:
     summary: str = ""  # replaces every message up to `upto_id`
     upto_id: int = 0
@@ -162,10 +221,11 @@ class Memory:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
-        present = {row["name"] for row in self._db.execute("PRAGMA table_info(messages)")}
-        for column, definition in _ADDED_COLUMNS.items():
-            if column not in present:
-                self._db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+        for table, columns in _ADDED_COLUMNS.items():
+            present = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in present:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self._migrate_fact_keys()
         self._db.commit()
 
@@ -339,6 +399,8 @@ class Memory:
                 self._db.execute("DELETE FROM messages WHERE conversation = ?", (conversation,))
                 self._db.execute("DELETE FROM conversation_state WHERE conversation = ?", (conversation,))
             self._db.execute("DELETE FROM messages WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM reminders WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM reminder_events WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM facts WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM accounts WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM people WHERE id = ?", (person_id,))
@@ -357,6 +419,8 @@ class Memory:
         db.execute("DELETE FROM facts WHERE person_id = ?", (source,))  # duplicates left behind
         db.execute("UPDATE accounts SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("UPDATE messages SET person_id = ? WHERE person_id = ?", (target, source))
+        db.execute("UPDATE reminders SET person_id = ? WHERE person_id = ?", (target, source))
+        db.execute("UPDATE reminder_events SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("DELETE FROM people WHERE id = ?", (source,))
 
     # ------------------------------------------------------------------
@@ -412,6 +476,151 @@ class Memory:
                 "DELETE FROM facts WHERE id = ? AND person_id = ?", (fact_id, person_id)
             )
             return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Reminders (scheduling and delivery rules live in reminders.py)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _stamp(moment: datetime) -> str:
+        """ISO text in UTC: these strings sort in time order."""
+        return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _reminder(row: sqlite3.Row) -> Reminder:
+        return Reminder(
+            row["id"],
+            row["person_id"],
+            row["text"],
+            datetime.fromisoformat(row["due_at"]),
+            datetime.fromisoformat(row["anchor_at"]),
+            row["repeat"],
+            row["timezone"],
+            row["surface"],
+            row["user_id"],
+            row["conversation"],
+        )
+
+    def add_reminder(
+        self,
+        person_id: int,
+        text: str,
+        due_at: datetime,
+        repeat: str = "",
+        zone: str = "",
+        origin: tuple[str, str, str] = ("", "", ""),
+    ) -> Reminder:
+        """`origin` is (surface, user_id, conversation) of where it was set: the answer that announces
+        the reminder is written in that conversation."""
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "INSERT INTO reminders (person_id, text, due_at, anchor_at, repeat, timezone, created_at,"
+                " surface, user_id, conversation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (person_id, text, self._stamp(due_at), self._stamp(due_at), repeat, zone, _now(), *origin),
+            )
+            row = self._db.execute("SELECT * FROM reminders WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return self._reminder(row)
+
+    def reminders_of(self, person_id: int) -> list[Reminder]:
+        """The reminders a person set that have not fired (a repeating one stays), soonest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM reminders WHERE person_id = ? ORDER BY due_at, id", (person_id,)
+            ).fetchall()
+        return [self._reminder(row) for row in rows]
+
+    def reminder_count(self, person_id: int) -> int:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM reminders WHERE person_id = ?", (person_id,)
+            ).fetchone()[0]
+
+    def delete_reminder(self, person_id: int, reminder_id: int) -> bool:
+        """Cancel one of the person's reminders (never someone else's)."""
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "DELETE FROM reminders WHERE id = ? AND person_id = ?", (reminder_id, person_id)
+            )
+            return cursor.rowcount > 0
+
+    def next_reminder_due(self) -> datetime | None:
+        with self._lock:
+            row = self._db.execute("SELECT MIN(due_at) FROM reminders").fetchone()
+        return datetime.fromisoformat(row[0]) if row[0] else None
+
+    def due_reminders(self, now: datetime) -> list[Reminder]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM reminders WHERE due_at <= ? ORDER BY due_at, id", (self._stamp(now),)
+            ).fetchall()
+        return [self._reminder(row) for row in rows]
+
+    def reminder_exists(self, reminder_id: int) -> bool:
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM reminders WHERE id = ?", (reminder_id,)).fetchone() is not None
+
+    def fire_reminder(
+        self, reminder: Reminder, next_due: datetime | None, now: datetime, message: str | None = None
+    ) -> ReminderEvent:
+        """Record that `reminder` came due (with the `message` Clara wrote for it, if any), then reschedule
+        it (`next_due`) or, if it was a one-off, remove it."""
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "INSERT INTO reminder_events (person_id, text, due_at, fired_at, message) VALUES (?, ?, ?, ?, ?)",
+                (reminder.person_id, reminder.text, self._stamp(reminder.due_at), self._stamp(now), message),
+            )
+            if next_due is None:
+                self._db.execute("DELETE FROM reminders WHERE id = ?", (reminder.id,))
+            else:
+                self._db.execute(
+                    "UPDATE reminders SET due_at = ? WHERE id = ?", (self._stamp(next_due), reminder.id)
+                )
+            author = self._db.execute(
+                "SELECT name FROM people WHERE id = ?", (reminder.person_id,)
+            ).fetchone()
+        return ReminderEvent(
+            cursor.lastrowid,
+            reminder.text,
+            self._stamp(reminder.due_at),
+            self._stamp(now),
+            author["name"] if author else None,
+            message,
+        )
+
+    def reminder_events_after(self, event_id: int, limit: int = 100) -> list[ReminderEvent]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT e.id, e.text, e.due_at, e.fired_at, p.name, e.message FROM reminder_events e"
+                " LEFT JOIN people p ON p.id = e.person_id WHERE e.id > ? ORDER BY e.id LIMIT ?",
+                (event_id, limit),
+            ).fetchall()
+        return [ReminderEvent(*row) for row in rows]
+
+    def last_reminder_event(self) -> int:
+        with self._lock:
+            return self._db.execute("SELECT COALESCE(MAX(id), 0) FROM reminder_events").fetchone()[0]
+
+    def prune_reminder_events(self, before: datetime) -> int:
+        with self._lock, self._db:
+            return self._db.execute(
+                "DELETE FROM reminder_events WHERE fired_at < ?", (self._stamp(before),)
+            ).rowcount
+
+    def reminder_cursor(self, client: str) -> int | None:
+        """The last event the client was sent, or None if it never connected."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT last_event_id FROM reminder_cursors WHERE client = ?", (client,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_reminder_cursor(self, client: str, event_id: int) -> None:
+        """Move a client's cursor forward (never back: two connections of one client may race)."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO reminder_cursors (client, last_event_id) VALUES (?, ?)"
+                " ON CONFLICT (client) DO UPDATE SET last_event_id = MAX(last_event_id, excluded.last_event_id)",
+                (client, event_id),
+            )
 
     # ------------------------------------------------------------------
     # Conversation history

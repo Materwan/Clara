@@ -121,6 +121,7 @@ class Settings:
     keep_recent_turns: int  # turns a compaction leaves unsummarised
     facts_token_budget: int  # tokens of remembered facts shown to the model in each prompt
     purge_summarised: bool  # delete messages once a summary stands for them
+    reminder_ai_timeout: int  # seconds Clara has to write the announcement of a reminder (0: announce the text)
     system_prompt_file: Path
     # Language model providers (see providers.py)
     default_provider: str
@@ -200,6 +201,7 @@ class Settings:
             keep_recent_turns=_non_negative_int(env, "CLARA_KEEP_RECENT_TURNS", 2),
             facts_token_budget=_positive_int(env, "CLARA_FACTS_TOKEN_BUDGET", 2000),
             purge_summarised=_flag(env, "CLARA_PURGE_SUMMARISED"),
+            reminder_ai_timeout=_non_negative_int(env, "CLARA_REMINDER_AI_TIMEOUT", 60),
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),
             default_provider=default_provider,
             local_host=text("OLLAMA_HOST", DEFAULT_LOCAL_HOST),

@@ -37,6 +37,7 @@ from .compaction import (
 from .llm import LlmBackend, LlmChunk
 from .memory import ConversationState, Fact, Memory, Person, StoredMessage, TurnRow
 from .prompt import SystemPrompt
+from .reminders import ReminderService
 from .tools import Toolbox, ToolContext
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,10 @@ class ModelTimeout(Exception):
 
 class PromptTooLarge(Exception):
     """What must be sent to the model does not fit in its context window."""
+
+
+class ServerStopping(Exception):
+    """The server is shutting down: it finishes what is running and takes nothing new."""
 
 
 async def with_idle_timeout(
@@ -113,6 +118,7 @@ class ChatRequest:
     prefix: str = ""  # shown to the model before the message, never in summaries
     ephemeral: bool = False  # a one-shot job: no persona, no memory, nothing stored
     timezone: str | None = None  # IANA name for the date and time shown to the model (default: the server's)
+    no_tools: bool = False  # the server's own tools are not offered (the model can only write)
 
     @property
     def conversation_id(self) -> str:
@@ -146,8 +152,10 @@ class Agent:
         first_token_timeout: float = 300.0,
         idle_timeout: float = 120.0,
         clock: Callable[[str | None], datetime] = now_in,
+        reminders: ReminderService | None = None,
     ):
         self.memory = memory
+        self.reminders = reminders  # lets the model's tools set reminders
         self.backend = backend
         self.toolbox = toolbox
         self.prompt = prompt
@@ -170,6 +178,13 @@ class Agent:
         # order, different threads run in parallel. Unused locks are garbage collected.
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._pending: dict[str, _Pending] = {}
+        self.accepting = True  # False once the server is stopping: no new turn, no new compaction
+        self._compactions = 0
+
+    @property
+    def busy(self) -> bool:
+        """Is a reply, an agent turn (waiting for its client's tools too) or a compaction running?"""
+        return self.stats.active > 0 or self._compactions > 0
 
     def _conversation_lock(self, conversation: str) -> asyncio.Lock:
         lock = self._locks.get(conversation)
@@ -295,6 +310,8 @@ class Agent:
         must run these and answer through `submit_results`), `usage` (one model round),
         `compacted`, `warning`, then a final `done`.
         """
+        if not self.accepting:
+            raise ServerStopping("The server is stopping and takes no new question.")
         self.stats.active += 1
         self.stats.turns += 1
         try:
@@ -320,9 +337,12 @@ class Agent:
         person = self.memory.resolve(request.surface, request.user_id, request.user_name)
         conversation = request.conversation_id
         ephemeral = request.ephemeral
-        context = ToolContext(person, self.memory)
+        context = ToolContext(
+            person, self.memory, self.reminders, request.timezone, request.surface, request.user_id, conversation
+        )
         client_tools = {schema["function"]["name"] for schema in request.tools}
-        schemas = ([] if ephemeral else list(self.toolbox.schemas)) + list(request.tools)
+        server_tools = [] if ephemeral or request.no_tools else list(self.toolbox.schemas)
+        schemas = server_tools + list(request.tools)
         turn_id = uuid.uuid4().hex
         yield {"type": "turn", "id": turn_id}
 
@@ -555,8 +575,14 @@ class Agent:
         The last `keep_recent_turns` turns stay as they are. Returns the context usage in
         percent before and after. NothingToCompact if there is nothing to summarise.
         """
-        async with self._conversation_lock(conversation):
-            return await self._compact_locked(conversation, focus)
+        if not self.accepting:
+            raise ServerStopping("The server is stopping and takes no new request.")
+        self._compactions += 1
+        try:
+            async with self._conversation_lock(conversation):
+                return await self._compact_locked(conversation, focus)
+        finally:
+            self._compactions -= 1
 
     async def _summarise(self, transcript: str, previous: str, focus: str) -> str:
         parts: list[str] = []

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .memory import Memory, Person
+from .reminders import REPEATS, ReminderError, ReminderService
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,15 @@ RECALL_LIMIT = 10
 class ToolContext:
     person: Person
     memory: Memory
+    reminders: ReminderService | None = None
+    timezone: str | None = None  # IANA name of the person's clock, when the client said it
+    surface: str = ""  # where the person is talking from, and in which conversation:
+    user_id: str = ""  # a reminder remembers them, to write its announcement there
+    conversation: str = ""
+
+    @property
+    def origin(self) -> tuple[str, str, str]:
+        return (self.surface, self.user_id, self.conversation)
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,41 @@ def _recall_facts(context: ToolContext, query: str) -> str:
     return "\n".join(f"[{fact.id}] {fact.text}" for fact in found)
 
 
+def _remind(context: ToolContext, text: str, when: str, repeat: str = "") -> str:
+    if context.reminders is None:
+        raise ValueError("Reminders are not available.")
+    try:
+        reminder = context.reminders.create(
+            context.person, str(text), str(when), str(repeat or ""), context.timezone, context.origin
+        )
+    except ReminderError as error:
+        raise ValueError(str(error)) from None
+    again = f", then {reminder.repeat}" if reminder.repeat else ""
+    return f"Reminder {reminder.id} set for {reminder.due_at.isoformat(timespec='seconds')} (UTC){again}."
+
+
+def _list_reminders(context: ToolContext) -> str:
+    if context.reminders is None:
+        raise ValueError("Reminders are not available.")
+    found = context.reminders.upcoming(context.person)
+    if not found:
+        return "No reminder set."
+    return "\n".join(
+        f"[{r.id}] {r.due_at.isoformat(timespec='seconds')} (UTC){' ' + r.repeat if r.repeat else ''}: {r.text}"
+        for r in found
+    )
+
+
+def _cancel_reminder(context: ToolContext, reminder_id: Any) -> str:
+    if context.reminders is None:
+        raise ValueError("Reminders are not available.")
+    try:
+        number = int(reminder_id)
+    except (TypeError, ValueError):
+        raise ValueError("reminder_id must be the number shown in brackets.") from None
+    return "Cancelled." if context.reminders.cancel(context.person, number) else "No such reminder of yours."
+
+
 def default_toolbox() -> Toolbox:
     return Toolbox(
         [
@@ -127,6 +172,36 @@ def default_toolbox() -> Toolbox:
                 function=_recall_facts,
                 parameters={"query": {"type": "string", "description": "Words to look for."}},
                 required=("query",),
+            ),
+            Tool(
+                name="remind",
+                description=(
+                    "Set a reminder: at that time its text is shown on EVERY client connected to Clara, "
+                    "not only this person's, so write it for any reader."
+                ),
+                function=_remind,
+                parameters={
+                    "text": {"type": "string", "description": "What to announce."},
+                    "when": {
+                        "type": "string",
+                        "description": "Local date and time, ISO 8601 without offset: 2026-10-05T09:00.",
+                    },
+                    "repeat": {"type": "string", "enum": list(REPEATS), "description": "Optional."},
+                },
+                required=("text", "when"),
+            ),
+            Tool(
+                name="list_reminders",
+                description="List this person's reminders that have not fired yet, with their ids.",
+                function=_list_reminders,
+                parameters={},
+            ),
+            Tool(
+                name="cancel_reminder",
+                description="Cancel one of this person's reminders, by id.",
+                function=_cancel_reminder,
+                parameters={"reminder_id": {"type": "integer", "description": "Id of the reminder."}},
+                required=("reminder_id",),
             ),
         ]
     )

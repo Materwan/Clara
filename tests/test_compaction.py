@@ -9,14 +9,15 @@ from clara.agent import Agent, ChatRequest
 from clara.compaction import build_transcript, chunk_messages, estimate_message_tokens
 from clara.memory import StoredMessage
 from clara.prompt import SystemPrompt
-from clara.tools import default_toolbox
+from clara.tools import Toolbox, default_toolbox
 
 CONVERSATION = "cli:erwan"
 
 
 def make_agent(memory, tmp_path: Path, backend, **options) -> Agent:
     options.setdefault("compact_percent", 0)
-    return Agent(memory, backend, default_toolbox(), SystemPrompt(tmp_path / "none.md"), **options)
+    toolbox = options.pop("toolbox", None) or default_toolbox()
+    return Agent(memory, backend, toolbox, SystemPrompt(tmp_path / "none.md"), **options)
 
 
 async def talk(agent: Agent, message: str) -> None:
@@ -149,7 +150,8 @@ async def test_the_size_after_compaction_counts_the_kept_turns(memory, tmp_path)
         say("a1", prompt_tokens=1_000), say("a2", prompt_tokens=2_000), say("a3", prompt_tokens=3_500),
         say("short summary"),
     )
-    agent = make_agent(memory, tmp_path, backend, context_window=4_000, keep_recent_turns=1)
+    # no tools: the sizes below are about the conversation, not about the tool schemas
+    agent = make_agent(memory, tmp_path, backend, toolbox=Toolbox([]), context_window=4_000, keep_recent_turns=1)
     for i in range(1, 4):
         await talk(agent, f"q{i} " + long)
 

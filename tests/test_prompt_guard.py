@@ -12,7 +12,7 @@ from clara.agent import Agent, ChatRequest, PromptTooLarge
 from clara.compaction import estimate_prompt_tokens, estimate_tokens
 from clara.prompt import SystemPrompt
 from clara.server import create_app
-from clara.tools import default_toolbox
+from clara.tools import Toolbox, default_toolbox
 
 CHAT = {"Authorization": "Bearer secret-cli"}
 READ_FILE = {
@@ -22,7 +22,8 @@ READ_FILE = {
 
 
 def make_agent(memory, tmp_path: Path, backend, **options) -> Agent:
-    return Agent(memory, backend, default_toolbox(), SystemPrompt(tmp_path / "none.md"), **options)
+    toolbox = options.pop("toolbox", None) or default_toolbox()
+    return Agent(memory, backend, toolbox, SystemPrompt(tmp_path / "none.md"), **options)
 
 
 def ask(message: str, **fields) -> ChatRequest:
@@ -60,9 +61,12 @@ def test_http_answers_413_and_the_stream_an_error_event(settings):
 
 
 async def test_a_history_larger_than_the_window_is_compacted_first(memory, tmp_path):
-    long = "w" * 1_200  # about 340 tokens
+    long = "w" * 1_300  # about 370 tokens
     backend = FakeBackend(*[say(f"a{i}") for i in range(1, 5)], say("summary of the early turns"), say("a5"))
-    agent = make_agent(memory, tmp_path, backend, context_window=2_000, compact_percent=0, keep_recent_turns=1)
+    # no tools: the sizes below are about the conversation, not about the tool schemas
+    agent = make_agent(
+        memory, tmp_path, backend, toolbox=Toolbox([]), context_window=2_000, compact_percent=0, keep_recent_turns=1
+    )
     for i in range(1, 5):
         await events_of(agent, ask(f"q{i} {long}"))
 

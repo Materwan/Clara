@@ -9,6 +9,10 @@
     POST   /v1/accounts/link-code       a code proving control of an account
     POST   /v1/accounts/link            "this account is the same person as that one" (needs the code)
     POST   /v1/turns/{id}/tool-results  a client's answer to a `tool_requests` event
+    POST   /v1/reminders                set a reminder: a text and a moment, announced to every client
+    GET    /v1/reminders                the reminders a person set that have not fired
+    DELETE /v1/reminders/{id}           cancel one
+    GET    /v1/reminders/stream         Server-Sent Events: `reminder` when one comes due (all clients)
     GET    /v1/conversations/{id}       size of the context, summary
     POST   /v1/conversations/{id}/compact   summarise the older messages
     DELETE /v1/conversations/{id}       forget the thread (facts are kept)
@@ -47,12 +51,16 @@ from .agent import (
     ModelTimeout,
     NothingToCompact,
     PromptTooLarge,
+    ServerStopping,
 )
+from .announce import compose
 from .commands import CommandContext, CommandResult, registry
+from .lifecycle import Lifecycle
 from .linking import LinkCodes
 from .memory import Memory, MergeRefused, Person
 from .prompt import SystemPrompt
 from .providers import ProviderManager
+from .reminders import ReminderError, ReminderService, describe
 from .settings import Settings, SettingsError
 from .tools import default_toolbox
 
@@ -121,6 +129,17 @@ class LinkBody(_Body):
     code: str = Field(min_length=1, max_length=100)  # ...proved with the code it was given...
     to_surface: Surface  # ...to the person who owns this one
     to_user_id: ExternalId
+
+
+class ReminderBody(_Body):
+    surface: Surface
+    user_id: ExternalId
+    user_name: str | None = Field(default=None, max_length=80)
+    text: str = Field(min_length=1, max_length=2000)
+    at: str = Field(min_length=1, max_length=64)  # ISO 8601, e.g. 2026-10-05T09:00 or ...T09:00+02:00
+    repeat: str = Field(default="", max_length=16)  # "", "daily", "weekly" or "monthly"
+    timezone: str | None = Field(default=None, max_length=64)  # IANA name; read a time without offset in it
+    conversation: str | None = Field(default=None, min_length=1, max_length=200)  # where Clara announces it
 
 
 class CommandBody(BaseModel):
@@ -218,6 +237,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             "client %r may speak for any surface: set CLARA_CLIENT_SURFACES to limit it", name
         )
     providers = providers or ProviderManager.from_settings(settings)
+    reminders = ReminderService(memory)
     agent = Agent(
         memory,
         providers,
@@ -234,20 +254,35 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         tool_timeout=settings.tool_timeout,
         first_token_timeout=settings.llm_first_token_timeout,
         idle_timeout=settings.llm_idle_timeout,
+        reminders=reminders,
     )
+
+    if settings.reminder_ai_timeout:
+        ai_timeout = float(settings.reminder_ai_timeout)
+        reminders.composer = lambda reminder: compose(agent, reminder, ai_timeout)
+    lifecycle = Lifecycle(agent, reminders)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
-        memory.close()
+        lifecycle.loop = asyncio.get_running_loop()
+        scheduler = asyncio.create_task(reminders.run())
+        try:
+            yield
+        finally:
+            scheduler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduler
+            memory.close()
 
     app = FastAPI(title="Clara", lifespan=lifespan)
     app.state.settings = settings
     app.state.memory = memory
     app.state.agent = agent
+    app.state.reminders = reminders
+    app.state.lifecycle = lifecycle
     app.state.providers = providers
     app.state.commands = CommandContext(
-        settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}"
+        settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}", lifecycle
     )
 
     def known_person(surface: Surface, user_id: ExternalId) -> Person:
@@ -260,7 +295,12 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
     async def health() -> dict:
         return {"status": "ok", "provider": providers.active, "model": providers.model}
 
+    def refuse_when_stopping() -> None:
+        if lifecycle.stopping:
+            raise HTTPException(503, "Clara is stopping and takes no new question.")
+
     def checked(http: Request, client: str, body: ChatBody) -> ChatRequest:
+        refuse_when_stopping()
         require_surface(http, client, body.surface)
         if body.conversation:
             require_conversation(http, client, body.conversation)
@@ -282,6 +322,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
                 final = event
         except PromptTooLarge as error:
             raise HTTPException(413, str(error)) from None
+        except ServerStopping as error:
+            raise HTTPException(503, str(error)) from None
         except ModelTimeout as error:
             raise HTTPException(504, str(error)) from None
         except Exception:
@@ -298,7 +340,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
                 async with contextlib.aclosing(with_keepalive(agent.turn(request, client))) as stream:
                     async for event in stream:
                         yield ": keepalive\n\n" if event is None else sse(event)
-            except (ClientToolTimeout, ModelTimeout, PromptTooLarge) as error:
+            except (ClientToolTimeout, ModelTimeout, PromptTooLarge, ServerStopping) as error:
                 yield sse({"type": "error", "message": str(error)})
             except Exception:
                 log.exception("chat stream failed (client=%s)", client)
@@ -309,6 +351,54 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/v1/reminders", status_code=201)
+    async def add_reminder(body: ReminderBody, client: Client, http: Request) -> dict:
+        require_surface(http, client, body.surface)
+        if body.conversation:
+            require_conversation(http, client, body.conversation)
+        person = memory.resolve(body.surface, body.user_id, body.user_name)
+        origin = (body.surface, body.user_id, body.conversation or f"{body.surface}:{body.user_id}")
+        try:
+            reminder = reminders.create(person, body.text, body.at, body.repeat, body.timezone, origin)
+        except ReminderError as error:
+            raise HTTPException(422, str(error)) from None
+        return describe(reminder)
+
+    @app.get("/v1/reminders/stream")
+    async def reminder_stream(client: Client) -> StreamingResponse:
+        """Every client gets every reminder: the surface restrictions do not apply here."""
+
+        async def events() -> AsyncIterator[str]:
+            try:
+                async with contextlib.aclosing(with_keepalive(reminders.events(client))) as stream:
+                    async for event in stream:
+                        yield ": keepalive\n\n" if event is None else sse(event)
+            except Exception:
+                log.exception("reminder stream failed (client=%s)", client)
+                yield sse({"type": "error", "message": "The reminder stream failed"})
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/v1/reminders")
+    async def list_reminders(client: Client, http: Request, surface: Surface, user_id: ExternalId) -> dict:
+        require_surface(http, client, surface)
+        person = memory.find_person(surface, user_id)
+        return {"reminders": [describe(r) for r in reminders.upcoming(person)] if person else []}
+
+    @app.delete("/v1/reminders/{reminder_id}")
+    async def cancel_reminder(
+        reminder_id: int, client: Client, http: Request, surface: Surface, user_id: ExternalId
+    ) -> dict:
+        require_surface(http, client, surface)
+        person = known_person(surface, user_id)
+        if not reminders.cancel(person, reminder_id):
+            raise HTTPException(404, "No such reminder of yours")
+        return {"deleted": reminder_id}
 
     @app.get("/v1/memory/facts")
     async def list_facts(
@@ -385,10 +475,13 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         conversation: str, body: CompactBody, client: Client, http: Request
     ) -> dict:
         require_conversation(http, client, conversation)
+        refuse_when_stopping()
         try:
             before, after = await agent.compact(conversation, body.focus)
         except NothingToCompact as error:
             raise HTTPException(409, str(error)) from None
+        except ServerStopping as error:
+            raise HTTPException(503, str(error)) from None
         except ModelTimeout as error:
             raise HTTPException(504, str(error)) from None
         except Exception:
@@ -424,10 +517,39 @@ def configure_logging() -> None:
     )
 
 
+class ClaraServer(uvicorn.Server):
+    """uvicorn, except that Ctrl+C / SIGTERM stop the server the careful way (see lifecycle.py): the first
+    one lets what is running finish, the second one does not wait."""
+
+    def __init__(self, config: uvicorn.Config, lifecycle: Lifecycle):
+        super().__init__(config)
+        self.lifecycle = lifecycle
+        lifecycle.on_exit = self.finish
+
+    def finish(self, forced: bool) -> None:
+        self.should_exit = True
+        if forced:  # do not wait for the turns that are running: cut them and their connections
+            self.force_exit = True
+            for task in list(self.server_state.tasks):
+                task.cancel()
+            for connection in list(self.server_state.connections):
+                transport = getattr(connection, "transport", None)
+                if transport is not None:
+                    transport.close()
+
+    def handle_exit(self, sig: int, frame) -> None:
+        if self.lifecycle.loop is None:  # not started yet: nothing to wait for
+            super().handle_exit(sig, frame)
+            return
+        self._captured_signals.append(sig)  # raised again once we are done, as uvicorn does
+        self.lifecycle.request_stop_threadsafe(force=self.lifecycle.stopping)
+
+
 async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
     """Run the HTTP server, plus the interactive console on the same event loop."""
+    lifecycle: Lifecycle = app.state.lifecycle
     if not with_console:
-        await uvicorn.Server(uvicorn.Config(app, host=settings.host, port=settings.port)).serve()
+        await ClaraServer(uvicorn.Config(app, host=settings.host, port=settings.port), lifecycle).serve()
         return
 
     from prompt_toolkit.patch_stdout import patch_stdout
@@ -437,8 +559,8 @@ async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
     # Everything is created inside patch_stdout so server logs print above the prompt
     with patch_stdout():
         configure_logging()  # again: the handler must capture the patched stderr
-        server = uvicorn.Server(
-            uvicorn.Config(app, host=settings.host, port=settings.port, access_log=False)
+        server = ClaraServer(
+            uvicorn.Config(app, host=settings.host, port=settings.port, access_log=False), lifecycle
         )
         server_task = asyncio.create_task(server.serve())
         while not server.started and not server_task.done():
@@ -456,12 +578,14 @@ async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
             run_console(
                 execute,
                 registry.describe(context),
-                banner="Clara console. /help for commands, /quit or Ctrl+D stops the server.",
+                banner="Clara console. /help for commands, /stop (or /quit, Ctrl+D) stops the server.",
                 history_path=settings.data_dir / "console_history.txt",
             )
         )
         await asyncio.wait({server_task, console_task}, return_when=asyncio.FIRST_COMPLETED)
-        server.should_exit = True
+        if not server_task.done():  # the console was closed: stop the server without cutting anybody off
+            log.info(lifecycle.request_stop())
+            await server_task
         console_task.cancel()
         await asyncio.gather(server_task, console_task, return_exceptions=True)
 

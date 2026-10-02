@@ -57,7 +57,8 @@ Both consoles run the same commands (the `/` is optional):
 | `/facts <person> [add <text>\|del <id>]` | read or edit what Clara knows (person = id, `surface:user` or name) |
 | `/forget-person <person> [confirm]` | erase a person: accounts, facts and what they said (without `confirm`, only shows what would go) |
 | `/link <surface:user> <person>` | make an account belong to a person (merges them) |
-| `/help [command]`, `/quit` | `/quit` stops the server from the embedded console, and only closes a remote one |
+| `/stop [now]` | stop the server: tell every client, refuse new questions, wait for running replies and agents, exit (`now`: do not wait); works from `clara-admin` too |
+| `/help [command]`, `/quit` | `/quit` stops the server like `/stop` from the embedded console, and only closes a remote one |
 
 ### Providers
 
@@ -107,7 +108,7 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 
 | Route | |
 | --- | --- |
-| `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}`; 413 if it cannot fit the model's window, 504 if the model hangs |
+| `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}`; 413 if it cannot fit the model's window, 504 if the model hangs, 503 if the server is stopping |
 | `POST /v1/chat/stream` | same body; Server-Sent Events `turn` / `token` / `tool` / `tool_requests` / `usage` / `compacted` / `warning` / `done` / `error` |
 | `POST /v1/turns/{id}/tool-results` | `{results: [{id, content}]}`: a client's answer to a `tool_requests` event (see below) |
 | `GET /v1/conversations/{id}` | `{tokens, window, percent, summary, messages}`: how full the context is |
@@ -115,6 +116,10 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 | `GET /v1/memory/facts?surface=&user_id=` | list a person's facts |
 | `POST /v1/memory/facts` | `{surface, user_id, text}` |
 | `DELETE /v1/memory/facts/{id}?surface=&user_id=` | |
+| `POST /v1/reminders` | `{surface, user_id, user_name?, text, at, repeat?, timezone?, conversation?}` → `{id, text, due_at, repeat}`; 422 if `at` is past or not ISO 8601 (see *Reminders*); `conversation` (default: the account's own) is where Clara writes the announcement |
+| `GET /v1/reminders?surface=&user_id=` | the person's reminders that have not fired yet |
+| `DELETE /v1/reminders/{id}?surface=&user_id=` | cancel one of the person's own reminders |
+| `GET /v1/reminders/stream` | Server-Sent Events: `reminder` when one comes due (**every client** gets every reminder, with the message Clara wrote) and `server` (running, stopping, stopped) |
 | `POST /v1/accounts/link-code` | `{surface, user_id}` → `{code, expires_in}`: proof of control of that account |
 | `POST /v1/accounts/link` | `{surface, user_id, code, to_surface, to_user_id}`; 403 bad code, 409 both accounts have memories |
 | `DELETE /v1/conversations/{id}` | forget a thread, keep the facts |
@@ -203,6 +208,65 @@ with httpx.stream("POST", "http://127.0.0.1:8765/v1/chat/stream",
 
 `src/clara/client.py` is a complete example.
 
+## Reminders
+
+A reminder is a text and a moment. When the moment comes, the server announces it to **every client**,
+whoever set it and whichever surface they speak for (`CLARA_CLIENT_SURFACES` does not apply: a reminder
+is a broadcast, so the person setting one should know that everybody will read it).
+
+- **Setting one.** `POST /v1/reminders` with `at` as ISO 8601: `2026-10-05T09:00+02:00`, or without an
+  offset (`2026-10-05T09:00`), read in `timezone` (an IANA name) or else the server's own timezone.
+  `repeat` is `daily`, `weekly` or `monthly`: the same wall-clock time again, and the same day of the
+  month, clamped to the month's length (the 31st is the 28th in February, then the 31st again). With a
+  `timezone` a repeat follows daylight saving; with only an offset it keeps that offset. The model can do
+  it too (`remind`, `list_reminders`, `cancel_reminder`; it reads `when` in the request's `timezone`),
+  and `clara-chat` and the console have `/remind`. At most 100 per person, 500 characters each.
+- **Clara writes the announcement.** When a reminder comes due, the server has Clara write the message that
+  is shown, instead of just the reminder's text: an ordinary turn in the conversation where the reminder was
+  set, as the person who set it. She knows what she knows about them, the exchange (`[Reminder due] …` and her
+  answer) is kept in their history, and she is told that everybody connected will read it. She has no tools in
+  that turn, so a reminder cannot create reminders. One message is written, the same for every client. If she
+  cannot write it within `CLARA_REMINDER_AI_TIMEOUT` seconds (60; the model is down or slow), or the reminder
+  was set before the server kept where, the reminder's own text is announced. `0` turns this off.
+  **Mind that** what she writes may draw on the author's private facts and goes to every client.
+- **Receiving them.** A client opens `GET /v1/reminders/stream` and keeps it open (a `: keepalive` comment
+  every 15 s; reconnect when it drops). An event is either
+  `{"type": "reminder", "id", "text", "message", "due_at", "fired_at", "from"}` (UTC times; `from` is who set
+  it; **show `message`**, which is what Clara wrote, or `text` when `message` is null), or
+  `{"type": "server", "state", "message"}`, the state of the server (see *Stopping the server*).
+- **Missing the moment.** Announced reminders are stored for 7 days, and the server remembers how far each
+  *client* (each token) has read. A client that connects after a reminder fired is sent what it missed,
+  oldest first, and tells the user: compare `fired_at` with the clock. A client the server has never seen
+  starts from now, with no backlog. A reminder is delivered at least once: if the connection drops while
+  it is being sent, it comes again on reconnection. Two connections made with the same token both get
+  what fires while they are open, but share what they missed.
+- **The server was down** at the moment: the reminder fires when it is back. A repeating one that missed
+  several occurrences fires once, then waits for its next.
+- **Privacy.** `/forget-person` also erases the person's reminders and what they announced. Only the person
+  who set a reminder can list or cancel it.
+
+## Stopping the server
+
+`/stop` (in the server's console, or `clara-admin /stop` from another computer with an admin token),
+Ctrl+C or SIGTERM stop the server **without cutting anybody off**:
+
+1. every client connected to `GET /v1/reminders/stream` is told: `{"type": "server", "state": "stopping"}`
+   (a client that connects meanwhile is told at once);
+2. new questions are refused with **HTTP 503** (`Clara is stopping and takes no new question`), and so are
+   new compactions; reminders that come due wait for the next start;
+3. the server **waits, with no time limit**, for what is running: replies being written, agents waiting for
+   their client's tools (`tool-results` are still accepted), summaries, announcements being written;
+4. clients get `{"type": "server", "state": "stopped"}`, their streams end, and the process exits.
+
+To stop without waiting: `/stop now`, or a second Ctrl+C. Running turns are then cut, and say so on their
+side. `/status` shows `STOPPING` and how many turns are awaited, and the log says so every 30 s. In the
+embedded console `/quit` and Ctrl+D do the same as `/stop`. Clients keep trying to reconnect: when the
+server is back they get `{"type": "server", "state": "running"}`.
+
+A client that has no event stream open (a script, a bot) is not told; it only sees the 503, or the
+connection closing. The three clients of this repository (`clara-chat`, the console, the desktop app) all
+listen and say "Clara is stopping / is not running / is running again".
+
 ## Simultaneous use
 
 - Turns in the **same conversation** are answered one after the other.
@@ -242,13 +306,14 @@ src/clara/
   llm.py        LlmBackend interface + Ollama implementation
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
+  reminders.py  reminders: parsing, repeats, the scheduler, each client's stream of announcements
   prompt.py     personality file + per-request context
   agent.py      one conversation turn (locks, server and client tools, streaming, storage, compaction)
   compaction.py transcript and summary request for long conversations
   commands.py   the console commands (/provider, /status...), shared by both consoles
   console.py    the interactive prompt (history, completion)
   server.py     FastAPI routes, auth, embedded console
-  client.py     clara-chat
+  client.py     clara-chat (also shows reminders, and has /remind)
   admin.py      clara-admin (remote console)
 config/system_prompt.md   Clara's personality, re-read when edited
 ```

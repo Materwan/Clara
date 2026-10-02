@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .agent import Agent
+from .lifecycle import Lifecycle
 from .memory import Memory, Person
 from .providers import ProviderError, ProviderManager
 from .settings import Settings
@@ -41,6 +42,7 @@ class CommandContext:
     providers: ProviderManager
     started_at: float
     listen: str  # "127.0.0.1:8765"
+    lifecycle: Lifecycle | None = None
 
 
 Handler = Callable[[CommandContext, str], "Awaitable[CommandResult | str]"]
@@ -162,9 +164,23 @@ async def help_command(ctx: CommandContext, args: str) -> str:
     )
 
 
-@registry.command("quit", "", "Close this console (the embedded one also stops the server)")
+@registry.command("quit", "", "Close this console (the embedded one also stops the server, like /stop)")
 async def quit_command(ctx: CommandContext, args: str) -> CommandResult:
     return CommandResult(quit=True)
+
+
+@registry.command(
+    "stop",
+    "[now]",
+    "Stop the server: tell every client, refuse new questions, wait for running replies and agents, then exit",
+    lambda ctx: ["now"],
+)
+async def stop_command(ctx: CommandContext, args: str) -> str:
+    if ctx.lifecycle is None:
+        raise CommandError("This server cannot be stopped from here.")
+    if args and args.lower() != "now":
+        raise CommandError("Usage: /stop [now]   (now: do not wait for what is running)")
+    return ctx.lifecycle.request_stop(force=bool(args))
 
 
 @registry.command("status", "", "Provider, model, activity and memory size")
@@ -172,10 +188,11 @@ async def status_command(ctx: CommandContext, args: str) -> str:
     stats = ctx.agent.stats
     people, facts = ctx.memory.counts()
     config = ctx.providers.config
+    stopping = f", STOPPING (waiting for {ctx.lifecycle.waiting_for} turn(s))" if ctx.lifecycle and ctx.lifecycle.stopping else ""
     rows = [
         ["Provider", f"{config.id} ({config.label}) at {config.host}"],
         ["Model", ctx.providers.model],
-        ["Server", f"{ctx.listen}, up {duration(time.monotonic() - ctx.started_at)}"],
+        ["Server", f"{ctx.listen}, up {duration(time.monotonic() - ctx.started_at)}" + stopping],
         ["Turns", f"{stats.active} running, {stats.turns} since start"],
         ["Tokens", f"{stats.prompt_tokens:,} prompt / {stats.completion_tokens:,} completion"],
         ["Memory", f"{people} people, {facts} facts ({ctx.settings.db_path})"],

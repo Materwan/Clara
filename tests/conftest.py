@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
 import pytest
+import uvicorn
 
 from clara.llm import LlmChunk, ToolCall
 from clara.memory import Memory
 from clara.providers import ProviderManager
+from clara.server import create_app
 from clara.settings import Settings
 
 
@@ -74,3 +78,18 @@ def fake_providers(settings: Settings, backend: FakeBackend | None = None) -> Pr
     return ProviderManager.from_settings(
         settings, factory=lambda config, model: backend or FakeBackend(model=model)
     )
+
+
+@pytest.fixture
+def live(settings):
+    """A real server on a free port: TestClient buffers a response, so it cannot read an endless stream."""
+    app = create_app(settings, fake_providers(settings, FakeBackend()))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    while not server.started:
+        time.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield app, f"http://127.0.0.1:{port}"
+    server.should_exit = True
+    thread.join(10)
