@@ -221,6 +221,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         max_tool_rounds=settings.max_tool_rounds,
         context_window=lambda: providers.context_window,
         compact_percent=settings.compact_percent,
+        keep_recent_turns=settings.keep_recent_turns,
         tool_timeout=settings.tool_timeout,
     )
 

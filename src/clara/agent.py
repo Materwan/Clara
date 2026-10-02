@@ -25,7 +25,14 @@ from datetime import datetime
 from typing import AsyncIterator, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .compaction import build_transcript, estimate_tokens, summary_request
+from .compaction import (
+    build_transcript,
+    chunk_messages,
+    estimate_message_tokens,
+    estimate_tokens,
+    summary_request,
+    transcript_budget,
+)
 from .llm import LlmBackend
 from .memory import ConversationState, Memory, Person, StoredMessage, TurnRow
 from .prompt import SystemPrompt
@@ -90,6 +97,8 @@ class Agent:
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
         context_window: int | Callable[[], int] = DEFAULT_CONTEXT_WINDOW,
         compact_percent: int = 80,
+        keep_recent_turns: int = 2,
+        transcript_chars: int | None = None,
         tool_timeout: float = 900.0,
         clock: Callable[[str | None], datetime] = now_in,
     ):
@@ -100,6 +109,8 @@ class Agent:
         self.history_turns = history_turns
         self.max_tool_rounds = max_tool_rounds
         self.compact_percent = compact_percent
+        self.keep_recent_turns = keep_recent_turns  # turns a compaction leaves as they are
+        self._transcript_chars = transcript_chars  # characters per summary request (default: from the window)
         self.tool_timeout = tool_timeout
         self._clock = clock
         self._context_window = context_window
@@ -360,32 +371,57 @@ class Agent:
     async def compact(self, conversation: str, focus: str = "") -> tuple[float, float]:
         """Replace the older messages of a conversation by a summary.
 
-        Returns the context usage in percent before and after. NothingToCompact if there is nothing
-        to summarise.
+        The last `keep_recent_turns` turns stay as they are. Returns the context usage in
+        percent before and after. NothingToCompact if there is nothing to summarise.
         """
         async with self._conversation_lock(conversation):
             return await self._compact_locked(conversation, focus)
 
-    async def _compact_locked(self, conversation: str, focus: str = "") -> tuple[float, float]:
-        state = self.memory.state(conversation)
-        rows = self.memory.messages_after(conversation, state.upto_id)
-        if not rows and not state.summary:
-            raise NothingToCompact("the conversation is empty: nothing to compact")
-        request = summary_request(build_transcript(rows), state.summary, focus)
+    async def _summarise(self, transcript: str, previous: str, focus: str) -> str:
         parts: list[str] = []
         async with self._llm_slots:
-            async for chunk in self.backend.stream(request, None):
+            async for chunk in self.backend.stream(summary_request(transcript, previous, focus), None):
                 parts.append(chunk.text)
         summary = "".join(parts).strip()
         if not summary:
             raise RuntimeError("the model returned an empty summary")
+        return summary
 
-        # What remains in the context is the fixed part (system prompt, tools) plus the summary.
-        replaced = estimate_tokens(state.summary) + sum(estimate_tokens(row.content) for row in rows)
-        fixed = max(0, state.context_tokens - replaced)
-        after_tokens = fixed + estimate_tokens(summary)
-        upto = rows[-1].id if rows else state.upto_id
-        self.memory.set_summary(conversation, summary, upto, after_tokens)
+    @staticmethod
+    def _split_recent(rows: list[StoredMessage], keep_turns: int) -> tuple[list[StoredMessage], list[StoredMessage]]:
+        """(rows to summarise, rows kept as they are): the kept ones start at the user message
+        `keep_turns` from the end. With fewer turns than that, everything is summarised."""
+        user_rows = [index for index, row in enumerate(rows) if row.role == "user"]
+        if keep_turns <= 0 or len(user_rows) <= keep_turns:
+            return rows, []
+        boundary = user_rows[-keep_turns]
+        return rows[:boundary], rows[boundary:]
+
+    async def _compact_locked(
+        self, conversation: str, focus: str = "", keep_recent_turns: int | None = None
+    ) -> tuple[float, float]:
+        keep = self.keep_recent_turns if keep_recent_turns is None else keep_recent_turns
+        state = self.memory.state(conversation)
+        rows = self.memory.messages_after(conversation, state.upto_id)
+        if not rows:
+            raise NothingToCompact("the conversation is empty: nothing to compact")
+        old, kept = self._split_recent(rows, keep)
+
+        # Summarise chunk by chunk. Each step is saved, so a failure halfway leaves a coherent
+        # conversation (the summary so far, then the messages not yet summarised).
+        summary = state.summary
+        for chunk in chunk_messages(old, self._transcript_chars or transcript_budget(self.window)):
+            transcript = build_transcript(chunk)
+            if transcript:
+                summary = await self._summarise(transcript, summary, focus)
+            self.memory.set_summary(conversation, summary, chunk[-1].id, state.context_tokens)
+
+        # What remains in the context: the fixed part (system prompt, tools), the summary, and the
+        # messages kept. The fixed part is what the last measure had beyond summary and messages.
+        measured = estimate_tokens(state.summary) + sum(estimate_message_tokens(row) for row in rows)
+        fixed = max(0, state.context_tokens - measured)
+        after_tokens = fixed + estimate_tokens(summary) + sum(estimate_message_tokens(row) for row in kept)
+        self.memory.set_summary(conversation, summary, old[-1].id, after_tokens)
         window = self.window
         return 100 * state.context_tokens / window, 100 * after_tokens / window
 

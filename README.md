@@ -157,8 +157,11 @@ reuse its cache of them.
 The `done` event reports `context: {tokens, window, percent}`. When a conversation fills `CLARA_COMPACT_PERCENT`
 of the provider's window, the server asks the model for a summary of the older messages (a `compacted` event says
 so) and from then on sends the summary instead of them; the messages stay in the database. `POST
-/v1/conversations/{id}/compact` does it on demand, with an optional focus. The summary is written once per
-compaction and is not meant to shrink conversations that are already short.
+/v1/conversations/{id}/compact` does it on demand, with an optional focus. The last
+`CLARA_KEEP_RECENT_TURNS` turns (2) are not summarised: the model goes on from them word for word. A
+conversation that is too long for one summary request is summarised in several steps, each continuing
+the previous one, so no message is skipped. The summary is not meant to shrink conversations that are
+already short.
 
 ### Writing a client
 
