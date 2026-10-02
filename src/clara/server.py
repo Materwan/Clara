@@ -74,11 +74,12 @@ class ChatBody(_Body):
     instructions: str = Field(default="", max_length=100_000)  # added to the system prompt
     prefix: str = Field(default="", max_length=50_000)  # put before the message, never summarised
     ephemeral: bool = False  # one-shot job: no persona, no memory, nothing stored
+    timezone: str | None = Field(default=None, max_length=64)  # IANA name, e.g. "Europe/Paris"
 
     def to_request(self) -> ChatRequest:
         return ChatRequest(
             self.surface, self.user_id, self.user_name, self.message, self.conversation,
-            tuple(self.tools), self.instructions, self.prefix, self.ephemeral,
+            tuple(self.tools), self.instructions, self.prefix, self.ephemeral, self.timezone,
         )
 
 

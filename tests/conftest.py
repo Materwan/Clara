@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -29,6 +30,11 @@ class FakeBackend:
         self.calls.append(([dict(m) for m in messages], tools))
         for chunk in self.rounds.pop(0):
             yield chunk
+
+
+def untimed(text: str) -> str:
+    """A user message without the `[time: HH:MM]` line the agent puts on the newest one."""
+    return re.sub(r"^\[time: \d\d:\d\d\]\n\n", "", text)
 
 
 def say(*pieces: str, prompt_tokens: int = 10, completion_tokens: int = 3) -> list[LlmChunk]:

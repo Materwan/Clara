@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, call, say
+from conftest import FakeBackend, call, say, untimed
 
 from clara.agent import Agent, ChatRequest, ClientToolTimeout, NothingToCompact
 from clara.prompt import SystemPrompt
@@ -88,7 +88,7 @@ async def test_the_turn_with_its_tool_calls_is_stored_and_replayed(memory, tmp_p
     assert roles == ["system", "user", "assistant", "tool", "assistant", "user"]
     assert replay[2]["tool_calls"][0]["function"]["name"] == "read_file"
     assert replay[3]["content"] == "FILE A"
-    assert replay[-1]["content"] == "and then?"
+    assert untimed(replay[-1]["content"]) == "and then?"
 
 
 async def test_old_tool_outputs_are_dropped_from_the_replay(memory, tmp_path):
@@ -115,7 +115,7 @@ async def test_history_keeps_only_the_last_turns(memory, tmp_path):
         await drive(agent, request(message=f"q{index}"))
     await drive(agent, request(message="q3"))
     sent = [m["content"] for m in backend.calls[-1][0] if m["role"] != "system"]
-    assert sent == ["q1", "a1", "q2", "a2", "q3"]
+    assert [untimed(text) for text in sent] == ["q1", "a1", "q2", "a2", "q3"]
 
 
 async def test_results_must_come_from_the_right_client_for_the_right_calls(memory, tmp_path):
@@ -214,9 +214,9 @@ async def test_instructions_and_prefix(memory, tmp_path):
 
     first = backend.calls[0][0]
     assert "## Instructions from console\nBe a coding agent." in first[0]["content"]
-    assert first[-1]["content"] == "[note: it is noon]\n\nhello"
+    assert first[-1]["content"].endswith("\n\n[note: it is noon]\n\nhello")
     second = backend.calls[1][0]
-    assert second[1]["content"] == "[note: it is noon]\n\nhello"  # history keeps the prefix, so the prompt prefix is stable
+    assert second[1]["content"] == "[note: it is noon]\n\nhello"  # history keeps the prefix, not the time
     stored = memory.messages_after("console:erwan")
     assert stored[0].content == "hello" and stored[0].prefix == "[note: it is noon]"
 
@@ -245,7 +245,7 @@ async def test_manual_compaction_replaces_older_messages_by_a_summary(memory, tm
     await drive(agent, request(message="q3"))
     prompt = backend.calls[3][0]
     assert "## Earlier in this conversation (summary)\nThe user asked q1 and q2." in prompt[0]["content"]
-    assert [m["content"] for m in prompt[1:]] == ["q3"]  # the compacted messages are not sent again
+    assert [untimed(m["content"]) for m in prompt[1:]] == ["q3"]  # the compacted messages are not sent again
 
 
 async def test_compacting_an_empty_conversation_or_failing_summary(memory, tmp_path):

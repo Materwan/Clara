@@ -129,6 +129,7 @@ machine. The request of `/v1/chat/stream` takes more fields:
 | `instructions` | text added to the system prompt (what this client is for, how to use its tools) |
 | `prefix` | text shown to the model before the message, kept in the history but left out of summaries (e.g. the date) |
 | `ephemeral` | a one-shot job: no Clara persona, no memory, no stored history, no server tools; the system prompt is just `instructions`. Used for sub-agents |
+| `timezone` | IANA name (`Europe/Paris`) for the date and time the model is told; default: the server's own |
 
 When the model calls one of the client's tools, the stream sends
 
@@ -146,6 +147,10 @@ ends it with an `error` event. A model slot is held only while the model works, 
 
 The tool calls and their results are stored with the conversation, so the model remembers what it did; the outputs
 of all but the 8 most recent tool calls are replaced by a short note when the history is replayed.
+
+The system prompt only holds the date, and the time of day is added to the newest user message (not
+stored), so the prompt and the replayed history stay identical from one turn to the next and Ollama can
+reuse its cache of them.
 
 ### Long conversations
 

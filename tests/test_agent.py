@@ -1,8 +1,10 @@
 import asyncio
+import re
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from conftest import FakeBackend, call, say
+from conftest import FakeBackend, call, say, untimed
 
 from clara.agent import Agent, ChatRequest
 from clara.prompt import SystemPrompt
@@ -93,7 +95,8 @@ async def test_messages_from_other_people_are_labelled(memory, tmp_path):
     history = backend.calls[1][0][1:-1]
     assert history[0] == {"role": "user", "content": "Alice: hello"}
     assert history[1] == {"role": "assistant", "content": "a"}
-    assert backend.calls[1][0][-1] == {"role": "user", "content": "and me?"}
+    last = backend.calls[1][0][-1]
+    assert last["role"] == "user" and untimed(last["content"]) == "and me?"
 
 
 async def test_turns_of_one_conversation_never_overlap(memory, tmp_path):
@@ -133,3 +136,43 @@ def test_system_prompt_rereads_the_file_when_edited(tmp_path):
         __import__("clara.memory", fromlist=["Person"]).Person(1, "Zoe"), "cli", [], datetime.now()
     )
     assert "Zoe" in rendered and "(nothing yet)" in rendered
+    assert "Date:" in rendered and not re.search(r"\d\d:\d\d", rendered)  # no time of day
+
+
+async def test_consecutive_turns_share_the_system_prompt_and_the_replayed_history(memory, tmp_path):
+    """Ollama can only reuse its cache of a prompt prefix that did not change."""
+    clock_values = iter([datetime(2026, 10, 2, 9, 5).astimezone(), datetime(2026, 10, 2, 17, 40).astimezone()] * 3)
+    backend = FakeBackend(say("a1"), say("a2"), say("a3"))
+    agent = make_agent(memory, tmp_path, backend, clock=lambda tz: next(clock_values))
+    for text in ("q1", "q2", "q3"):
+        await run(agent, message=text)
+
+    second, third = backend.calls[1][0], backend.calls[2][0]
+    assert second[0] == third[0] == backend.calls[0][0][0]  # same system prompt, whatever the time
+    assert third[:3] == [second[0], {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    assert second[-1]["content"] == "[time: 17:40]\n\nq2"  # the time rides on the newest message...
+    assert [m.content for m in memory.history("cli:erwan", 10)] == ["q1", "a1", "q2", "a2", "q3", "a3"]  # ...only
+
+
+async def test_the_timezone_of_the_client_sets_the_date_and_time(memory, tmp_path):
+    from datetime import timezone
+
+    def clock(name):
+        return datetime(2026, 10, 2, 23, 30, tzinfo=timezone.utc).astimezone(ZoneInfo(name)) if name else None
+
+    backend = FakeBackend(say("ok"))
+    agent = make_agent(memory, tmp_path, backend, clock=clock)
+    await run(agent, message="hi", timezone="Asia/Tokyo")
+    assert "2026-10-03" in backend.calls[0][0][0]["content"]  # already tomorrow there
+    assert backend.calls[0][0][-1]["content"].startswith("[time: 08:30]")
+
+
+def test_an_unknown_timezone_is_refused(memory, tmp_path):
+    agent = make_agent(memory, tmp_path, FakeBackend())
+    request = ChatRequest("cli", "erwan", None, "hi", timezone="Mars/Olympus")
+    try:
+        agent.validate(request)
+    except ValueError as error:
+        assert "Mars/Olympus" in str(error)
+    else:
+        raise AssertionError("expected ValueError")

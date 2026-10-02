@@ -23,6 +23,7 @@ import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import AsyncIterator, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .compaction import build_transcript, estimate_tokens, summary_request
 from .llm import LlmBackend
@@ -37,6 +38,11 @@ MAX_FACTS_IN_PROMPT = 100
 RECENT_TOOL_RESULTS_KEPT = 8  # older tool outputs are replaced by a note, to save context
 OMITTED = "[output omitted to save context]"
 DEFAULT_CONTEXT_WINDOW = 32_768
+
+
+def now_in(timezone: str | None) -> datetime:
+    """The current time in an IANA timezone ("Europe/Paris"), or the server's own."""
+    return datetime.now(ZoneInfo(timezone)) if timezone else datetime.now().astimezone()
 
 
 class NothingToCompact(Exception):
@@ -58,6 +64,7 @@ class ChatRequest:
     instructions: str = ""  # added to the system prompt (what the client is for)
     prefix: str = ""  # shown to the model before the message, never in summaries
     ephemeral: bool = False  # a one-shot job: no persona, no memory, nothing stored
+    timezone: str | None = None  # IANA name for the date and time shown to the model (default: the server's)
 
     @property
     def conversation_id(self) -> str:
@@ -84,6 +91,7 @@ class Agent:
         context_window: int | Callable[[], int] = DEFAULT_CONTEXT_WINDOW,
         compact_percent: int = 80,
         tool_timeout: float = 900.0,
+        clock: Callable[[str | None], datetime] = now_in,
     ):
         self.memory = memory
         self.backend = backend
@@ -93,6 +101,7 @@ class Agent:
         self.max_tool_rounds = max_tool_rounds
         self.compact_percent = compact_percent
         self.tool_timeout = tool_timeout
+        self._clock = clock
         self._context_window = context_window
         self.stats = AgentStats()
         self._llm_slots = asyncio.Semaphore(max_concurrent_llm)
@@ -116,6 +125,11 @@ class Agent:
     # ------------------------------------------------------------------
     def validate(self, request: ChatRequest) -> None:
         """Raise ValueError if the request's tools are unusable (checked before streaming)."""
+        if request.timezone:
+            try:
+                ZoneInfo(request.timezone)
+            except (ZoneInfoNotFoundError, ValueError, OSError):
+                raise ValueError(f"Unknown timezone: {request.timezone}") from None
         names: set[str] = set()
         for schema in request.tools:
             function = schema.get("function") if isinstance(schema, dict) else None
@@ -178,19 +192,23 @@ class Agent:
 
     def _build_messages(self, request: ChatRequest, person: Person, state: ConversationState) -> list[dict]:
         messages: list[dict] = []
+        now = self._clock(request.timezone)
         if request.ephemeral:
             if request.instructions.strip():
                 messages.append({"role": "system", "content": request.instructions.strip()})
         else:
             facts = self.memory.facts(person.id, MAX_FACTS_IN_PROMPT)
             system = self.prompt.render(
-                person, request.surface, facts, datetime.now().astimezone(),
-                request.instructions, state.summary,
+                person, request.surface, facts, now, request.instructions, state.summary,
             )
             messages.append({"role": "system", "content": system})
             stored = self.memory.history(request.conversation_id, self.history_turns, state.upto_id)
             messages.extend(self._replay(stored, person))
-        messages.append({"role": "user", "content": self._user_content(request.message, request.prefix)})
+        content = self._user_content(request.message, request.prefix)
+        if not request.ephemeral:
+            # Only here, never stored: replayed history and system prompt stay identical between turns
+            content = f"[time: {now.strftime('%H:%M')}]\n\n{content}"
+        messages.append({"role": "user", "content": content})
         return messages
 
     # ------------------------------------------------------------------
