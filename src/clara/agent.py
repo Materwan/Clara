@@ -33,7 +33,7 @@ from .compaction import (
     summary_request,
     transcript_budget,
 )
-from .llm import LlmBackend
+from .llm import LlmBackend, LlmChunk
 from .memory import ConversationState, Memory, Person, StoredMessage, TurnRow
 from .prompt import SystemPrompt
 from .tools import Toolbox, ToolContext
@@ -58,6 +58,38 @@ class NothingToCompact(Exception):
 
 class ClientToolTimeout(Exception):
     """The client did not send the results of its tools in time."""
+
+
+class ModelTimeout(Exception):
+    """The model stopped answering."""
+
+
+async def with_idle_timeout(
+    stream: AsyncIterator[LlmChunk], first: float, idle: float
+) -> AsyncIterator[LlmChunk]:
+    """The chunks of `stream`; ModelTimeout if none comes within `first` seconds, then `idle`
+    seconds of each other (a model that has hung would hold its slot for ever)."""
+    iterator = stream.__aiter__()
+    wait = first
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), wait)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                what = "to start answering" if wait == first else "between two pieces of its answer"
+                raise ModelTimeout(f"The model took more than {wait:g} seconds {what}.") from None
+            wait = idle
+            yield chunk
+    finally:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close()
+
+
+_END = object()
 
 
 @dataclass(frozen=True)
@@ -100,6 +132,8 @@ class Agent:
         keep_recent_turns: int = 2,
         transcript_chars: int | None = None,
         tool_timeout: float = 900.0,
+        first_token_timeout: float = 300.0,
+        idle_timeout: float = 120.0,
         clock: Callable[[str | None], datetime] = now_in,
     ):
         self.memory = memory
@@ -112,9 +146,12 @@ class Agent:
         self.keep_recent_turns = keep_recent_turns  # turns a compaction leaves as they are
         self._transcript_chars = transcript_chars  # characters per summary request (default: from the window)
         self.tool_timeout = tool_timeout
+        self.first_token_timeout = first_token_timeout  # seconds before the model starts answering
+        self.idle_timeout = idle_timeout  # seconds the model may pause once it has started
         self._clock = clock
         self._context_window = context_window
         self.stats = AgentStats()
+        self.max_concurrent_llm = max_concurrent_llm
         self._llm_slots = asyncio.Semaphore(max_concurrent_llm)
         # One lock per conversation: two messages of the same thread are answered in
         # order, different threads run in parallel. Unused locks are garbage collected.
@@ -283,8 +320,9 @@ class Agent:
                 text_parts: list[str] = []
                 calls = []
                 round_prompt = round_completion = 0
-                async with self._llm_slots:  # held for one model round, not while a client works
-                    async for chunk in self.backend.stream(messages, schemas if offer_tools else None):
+                # aclosing: if the client goes away at a yield, the model task stops now
+                async with contextlib.aclosing(self._model(messages, schemas if offer_tools else None)) as model:
+                    async for chunk in model:
                         round_prompt += chunk.prompt_tokens
                         round_completion += chunk.completion_tokens
                         calls.extend(chunk.tool_calls)
@@ -363,6 +401,36 @@ class Agent:
             "provider": getattr(self.backend, "active", ""),
         }
 
+    async def _model(self, messages: list[dict], tools: list[dict] | None) -> AsyncIterator[LlmChunk]:
+        """One model round. A task reads the model and holds a slot while it works, and passes
+        the chunks on through a queue: a client that reads slowly (or not at all) cannot keep a
+        slot busy, and a model that hangs times out."""
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def produce() -> None:
+            try:
+                async with self._llm_slots:
+                    stream = self.backend.stream(messages, tools)
+                    async for chunk in with_idle_timeout(stream, self.first_token_timeout, self.idle_timeout):
+                        queue.put_nowait(chunk)
+                queue.put_nowait(_END)
+            except Exception as error:
+                queue.put_nowait(error)
+
+        producer = asyncio.ensure_future(produce())
+        try:
+            while True:
+                item = await queue.get()
+                if item is _END:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            producer.cancel()  # the consumer left (or failed): stop reading, free the slot
+            with contextlib.suppress(BaseException):
+                await producer
+
     def _history_overflows(self, conversation: str, state: ConversationState) -> bool:
         """Are there more turns waiting than the prompt takes back (`history_turns`)?"""
         return bool(self.compact_percent) and (
@@ -397,8 +465,8 @@ class Agent:
 
     async def _summarise(self, transcript: str, previous: str, focus: str) -> str:
         parts: list[str] = []
-        async with self._llm_slots:
-            async for chunk in self.backend.stream(summary_request(transcript, previous, focus), None):
+        async with contextlib.aclosing(self._model(summary_request(transcript, previous, focus), None)) as model:
+            async for chunk in model:
                 parts.append(chunk.text)
         summary = "".join(parts).strip()
         if not summary:

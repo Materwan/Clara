@@ -184,6 +184,9 @@ with httpx.stream("POST", "http://127.0.0.1:8765/v1/chat/stream",
 - Turns in the **same conversation** are answered one after the other.
 - Turns in **different conversations** run in parallel, up to
   `CLARA_MAX_CONCURRENT_LLM` model calls at once.
+- A model slot is held only while the model works: a client that reads its stream slowly, or not at
+  all, never keeps one busy. A model that stops answering is given up on after
+  `CLARA_LLM_FIRST_TOKEN_TIMEOUT` / `CLARA_LLM_IDLE_TIMEOUT` seconds (an `error` event, or 504).
 - Memory is written only by the server process, so clients never conflict.
 
 ## Security

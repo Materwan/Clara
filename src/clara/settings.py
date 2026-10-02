@@ -105,6 +105,8 @@ class Settings:
     max_concurrent_llm: int
     max_tool_rounds: int
     tool_timeout: int  # seconds a client may take to run its tools (it may ask the user first)
+    llm_first_token_timeout: int  # seconds the model may take to start answering
+    llm_idle_timeout: int  # seconds the model may pause between two pieces of its answer
     compact_percent: int  # summarise a conversation when its context is this full (0 = never)
     keep_recent_turns: int  # turns a compaction leaves unsummarised
     system_prompt_file: Path
@@ -174,6 +176,8 @@ class Settings:
             max_concurrent_llm=_positive_int(env, "CLARA_MAX_CONCURRENT_LLM", 2),
             max_tool_rounds=_positive_int(env, "CLARA_MAX_TOOL_ROUNDS", 40),
             tool_timeout=_positive_int(env, "CLARA_TOOL_TIMEOUT", 900),
+            llm_first_token_timeout=_positive_int(env, "CLARA_LLM_FIRST_TOKEN_TIMEOUT", 300),
+            llm_idle_timeout=_positive_int(env, "CLARA_LLM_IDLE_TIMEOUT", 120),
             compact_percent=_non_negative_int(env, "CLARA_COMPACT_PERCENT", 80),
             keep_recent_turns=_non_negative_int(env, "CLARA_KEEP_RECENT_TURNS", 2),
             system_prompt_file=Path(text("CLARA_SYSTEM_PROMPT_FILE", "config/system_prompt.md")),

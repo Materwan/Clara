@@ -40,7 +40,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from .agent import Agent, ChatRequest, ClientToolTimeout, NothingToCompact
+from .agent import Agent, ChatRequest, ClientToolTimeout, ModelTimeout, NothingToCompact
 from .commands import CommandContext, CommandResult, registry
 from .linking import LinkCodes
 from .memory import Memory, MergeRefused, Person
@@ -223,6 +223,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         compact_percent=settings.compact_percent,
         keep_recent_turns=settings.keep_recent_turns,
         tool_timeout=settings.tool_timeout,
+        first_token_timeout=settings.llm_first_token_timeout,
+        idle_timeout=settings.llm_idle_timeout,
     )
 
     @asynccontextmanager
@@ -269,6 +271,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         try:
             async for event in agent.turn(request, client):
                 final = event
+        except ModelTimeout as error:
+            raise HTTPException(504, str(error)) from None
         except Exception:
             log.exception("chat failed (client=%s)", client)
             raise HTTPException(502, "The language model failed") from None
@@ -283,7 +287,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
                 async with contextlib.aclosing(with_keepalive(agent.turn(request, client))) as stream:
                     async for event in stream:
                         yield ": keepalive\n\n" if event is None else sse(event)
-            except ClientToolTimeout as error:
+            except (ClientToolTimeout, ModelTimeout) as error:
                 yield sse({"type": "error", "message": str(error)})
             except Exception:
                 log.exception("chat stream failed (client=%s)", client)
@@ -374,6 +378,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             before, after = await agent.compact(conversation, body.focus)
         except NothingToCompact as error:
             raise HTTPException(409, str(error)) from None
+        except ModelTimeout as error:
+            raise HTTPException(504, str(error)) from None
         except Exception:
             log.exception("compaction failed (client=%s)", client)
             raise HTTPException(502, "The language model failed") from None
