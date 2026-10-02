@@ -30,12 +30,12 @@ export CLARA_TOKEN=<one of the tokens>
 .venv/bin/clara-chat --user erwan --name Erwan
 ```
 
-Tests: `pytest`.
+Tests: `pytest`. Lint: `ruff check .` (both run in CI on Linux and Windows, Python 3.11 and 3.12).
 
 ## The console
 
 Started in a terminal, `clara-server` shows a prompt beside the server logs
-(history, Tab completion). Without a terminal (systemd, Docker) or with
+(history, Tab completion). Without a terminal (systemd) or with
 `--no-console`, there is no prompt.
 
 To use the same console **from another computer**, set `CLARA_ADMIN_TOKENS` on
@@ -238,6 +238,7 @@ See `deploy/clara.service` (systemd). Ollama must be reachable from the server
 src/clara/
   settings.py   environment configuration
   memory.py     SQLite: people, accounts, facts, history
+  linking.py    single-use codes that prove control of an account before it is linked
   llm.py        LlmBackend interface + Ollama implementation
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
@@ -255,6 +256,7 @@ config/system_prompt.md   Clara's personality, re-read when edited
 ## Next steps
 
 - Semantic recall of facts (embeddings).
-- A second LLM provider: implement `LlmBackend.stream()`.
+- A backend that is not Ollama: implement `LlmBackend.stream()` (the two providers, local and cloud, are
+  both Ollama).
 - Turn the existing Discord bot into a client of this server.
 - Scheduled / proactive tasks.

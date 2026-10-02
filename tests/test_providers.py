@@ -116,7 +116,7 @@ def test_settings_reject_a_token_used_for_chat_and_admin():
         Settings.from_env({"CLARA_TOKENS": "a:same", "CLARA_ADMIN_TOKENS": "b:same"})
 
 
-async def test_api_key_provider_rejects_a_bad_key(settings):
+async def test_api_key_provider_rejects_a_bad_key(settings, monkeypatch):
     import httpx
 
     from clara.llm import OllamaBackend
@@ -127,18 +127,16 @@ async def test_api_key_provider_rejects_a_bad_key(settings):
         return httpx.Response(200 if ok else 401, json={})
 
     real_client = httpx.AsyncClient
-    httpx.AsyncClient = lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
-    try:
-        class Listing:  # stands in for the ollama client's /api/tags
-            async def list(self):
-                from types import SimpleNamespace as NS
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
 
-                return NS(models=[NS(model="gpt-oss:120b")])
+    class Listing:  # stands in for the ollama client's /api/tags
+        async def list(self):
+            from types import SimpleNamespace as NS
 
-        bad = OllamaBackend("m", host="https://ollama.com", api_key="bad", client=Listing())
-        good = OllamaBackend("m", host="https://ollama.com", api_key="good", client=Listing())
-        with pytest.raises(PermissionError, match="rejected"):
-            await bad.verify()
-        await good.verify()
-    finally:
-        httpx.AsyncClient = real_client
+            return NS(models=[NS(model="gpt-oss:120b")])
+
+    bad = OllamaBackend("m", host="https://ollama.com", api_key="bad", client=Listing())
+    good = OllamaBackend("m", host="https://ollama.com", api_key="good", client=Listing())
+    with pytest.raises(PermissionError, match="rejected"):
+        await bad.verify()
+    await good.verify()

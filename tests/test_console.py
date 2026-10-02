@@ -1,11 +1,9 @@
-import contextlib
 import asyncio
-import json
+import contextlib
 
 import pytest
 from conftest import FakeBackend, fake_providers, say
 from fastapi.testclient import TestClient
-from prompt_toolkit.completion import Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput

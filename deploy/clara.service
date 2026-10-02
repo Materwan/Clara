@@ -12,7 +12,8 @@ Wants=network-online.target
 Type=simple
 User=clara
 WorkingDirectory=/opt/clara
-# Holds CLARA_TOKENS, CLARA_MODEL, CLARA_DATA_DIR... (see .env.example)
+# Holds CLARA_TOKENS, CLARA_LOCAL_MODEL / CLARA_CLOUD_MODEL, OLLAMA_API_KEY, CLARA_DATA_DIR...
+# (see .env.example)
 EnvironmentFile=/opt/clara/.env
 ExecStart=/opt/clara/.venv/bin/clara-server
 Restart=on-failure

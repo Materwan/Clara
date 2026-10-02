@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clara-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "Clara: one AI with one memory, served over HTTP to any number of clients"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
 
 [project.scripts]
 clara-server = "clara.server:main"
@@ -27,6 +27,17 @@ clara-admin = "clara.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]  # pycodestyle, pyflakes, import order, bugbear
+ignore = [
+    "E501",  # long lines are left to the author's judgement
+    "B905",  # zip() without strict=
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
