@@ -66,8 +66,8 @@ async def test_the_announcement_is_what_clara_wrote(memory, tmp_path):
     [event] = memory.reminder_events_after(0)
     assert event.message == "Erwan, your dentist is waiting for you at 9!"
     assert event.text == "Dentist at 9"  # the reminder itself is kept too
-    memory.set_reminder_cursor("terminal", 0)  # a client that has connected before
-    stream = service.events("terminal")
+    memory.set_reminder_cursor("terminal/cli:erwan", 0)  # a client that has connected before
+    stream = service.events("terminal", "cli", "erwan")
     payload = await asyncio.wait_for(anext(stream), 2)
     while payload["type"] != "reminder":  # (it also says the server is running)
         payload = await asyncio.wait_for(anext(stream), 2)
@@ -85,7 +85,7 @@ async def test_she_writes_as_the_author_with_what_she_knows_about_them(memory, t
 
     messages, tools = backend.calls[0]
     system = messages[0]["content"]
-    assert "Erwan likes jazz" in system and "EVERYONE" in system  # the author's facts, and who will read it
+    assert "Erwan likes jazz" in system and "shown to them as a notification" in system  # facts, and who reads it
     assert "[Reminder due] Dentist at 9" in messages[-1]["content"]
     assert not tools  # she can only write: no tool to call (no reminder from a reminder)
 
@@ -109,9 +109,12 @@ async def test_if_she_cannot_write_it_the_text_is_announced(memory, tmp_path, ba
 
     assert await service.fire_due() == 1  # fired all the same
 
-    [event] = memory.reminder_events_after(0)
+    event, why = memory.reminder_events_after(0)
     assert event.message is None and event.text == "Dentist at 9"
     assert service.upcoming(memory.resolve("cli", "erwan", "Erwan")) == []
+    # ...and the person is told why it is shown as typed
+    assert (why.kind, why.source, why.person_id) == ("notification", "server", event.person_id)
+    assert "could not write the announcement" in why.text and "Dentist at 9" in why.text
 
 
 async def test_a_reminder_set_before_the_place_was_kept_is_announced_as_it_is(memory, tmp_path):

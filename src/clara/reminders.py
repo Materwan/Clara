@@ -1,19 +1,15 @@
-"""Reminders: a text and a moment, announced to every connected client when the moment comes.
+"""Reminders: a text and a moment, announced to the person who set it when the moment comes.
 
-    create()   a client (or the model, through a tool) sets one
+    create()   a client (or the model, through a tool) sets one, for some of the person's surfaces
     run()      the scheduler: when one is due it becomes an *event*, and a repeating one is moved on
-    events()   one client's stream of events, oldest first
+    events()   one listener's stream of events, oldest first (see notifications.py)
+
+A reminder is shown only to the person who set it, on the surfaces it was set for (`targets`: `app`,
+`discord`...), or on every client of theirs when it names none.
 
 When one comes due, Clara writes the announcement herself (see announce.py) and that message is what the
-clients show; if she cannot, they show the reminder's own text.
-
-The same stream also tells every client what the server is doing (`server` events: running, stopping,
-stopped), so that they can say "Clara is not running" instead of just failing.
-
-Events are stored, and each client has a cursor (how far it has read). A client that connects
-after a reminder fired, because it was off or offline at that moment, is sent what it missed;
-a client seeing the server for the first time starts from now. Two connections of one client
-(same token) both get what fires while they are open, and share the cursor.
+clients show; if she cannot, they show the reminder's own text, and the person is told why by a
+notification.
 """
 
 from __future__ import annotations
@@ -24,27 +20,21 @@ import contextlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone, tzinfo
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .memory import Memory, Person, Reminder, ReminderEvent
+from .memory import Memory, Person, Reminder
+from .notifications import SERVER, NotificationError, Notifier, clean_targets
 
 log = logging.getLogger(__name__)
 
 REPEATS = ("daily", "weekly", "monthly")
 MAX_TEXT = 500
 MAX_PER_PERSON = 100
-EVENT_RETENTION = timedelta(days=7)  # a client offline longer than this misses the reminder
 MAX_SLEEP = 30.0  # seconds: the scheduler looks again at least this often (clock changes, safety net)
-BATCH = 100  # events read from the database at a time
 
-SERVER_MESSAGES = {
-    "running": "Clara is running",
-    "stopping": "Clara is stopping: she finishes what is running and takes nothing new",
-    "stopped": "Clara is not running",
-}
-
-# Writes the announcement of a reminder that came due: its text, or None to announce the reminder as it is
+# Writes the announcement of a reminder that came due: its text, or None to announce the reminder as it is.
+# It raises AnnounceFailed when it should have written one and could not.
 Composer = Callable[[Reminder], Awaitable["str | None"]]
 
 _OFFSET = re.compile(r"^([+-])(\d\d):(\d\d)$")
@@ -52,6 +42,10 @@ _OFFSET = re.compile(r"^([+-])(\d\d):(\d\d)$")
 
 class ReminderError(ValueError):
     """The reminder cannot be created as asked (the message says why)."""
+
+
+class AnnounceFailed(Exception):
+    """Clara could not write the announcement of a reminder (the message says why)."""
 
 
 def _utc_now() -> datetime:
@@ -127,31 +121,25 @@ def describe(reminder: Reminder) -> dict[str, Any]:
         "text": reminder.text,
         "due_at": reminder.due_at.isoformat(timespec="seconds"),
         "repeat": reminder.repeat,
-    }
-
-
-def event_payload(event: ReminderEvent) -> dict[str, Any]:
-    return {
-        "type": "reminder",
-        "id": event.id,
-        "text": event.text,
-        "due_at": event.due_at,
-        "fired_at": event.fired_at,
-        "from": event.author,
-        "message": event.message,  # what Clara wrote; None: show `text`
+        "targets": list(reminder.targets),  # empty: every surface of the person
     }
 
 
 class ReminderService:
-    def __init__(self, memory: Memory, clock: Callable[[], datetime] = _utc_now):
+    def __init__(
+        self, memory: Memory, clock: Callable[[], datetime] = _utc_now, notifier: Notifier | None = None
+    ):
         self.memory = memory
         self._clock = clock
+        self.notifier = notifier or Notifier(memory, clock)  # delivers what fires
         self._wake = asyncio.Event()  # something changed: the scheduler looks again
-        self._listeners: set[asyncio.Event] = set()  # one per open client stream
         self.composer: Composer | None = None  # who writes the announcements (None: the text is announced)
         self.stopping = False  # the server is stopping: what comes due waits for the next start
         self.firing = False  # announcements are being written
-        self.server_state = "running"
+
+    @property
+    def server_state(self) -> str:
+        return self.notifier.server_state
 
     # -- setting and cancelling ------------------------------------------------------------- #
 
@@ -163,9 +151,15 @@ class ReminderService:
         repeat: str = "",
         zone: str | None = None,
         origin: tuple[str, str, str] = ("", "", ""),
+        targets: Iterable[str] | str | None = (),
     ) -> Reminder:
         """Set a reminder. `origin` is (surface, user_id, conversation) of where it was asked: Clara writes
-        the announcement there. Raises :class:`ReminderError` when it is invalid or in the past."""
+        the announcement there. `targets`: the surfaces of the person it is shown on (empty: all of them).
+        Raises :class:`ReminderError` when it is invalid or in the past."""
+        try:
+            surfaces = clean_targets(targets)
+        except NotificationError as error:
+            raise ReminderError(str(error)) from None
         text = " ".join((text or "").split())
         if not text:
             raise ReminderError("A reminder needs a text.")
@@ -179,7 +173,7 @@ class ReminderService:
             raise ReminderError("That moment is already past.")
         if self.memory.reminder_count(person.id) >= MAX_PER_PERSON:
             raise ReminderError(f"At most {MAX_PER_PERSON} reminders at a time: cancel some first.")
-        reminder = self.memory.add_reminder(person.id, text, due, repeat, clock, origin)
+        reminder = self.memory.add_reminder(person.id, text, due, repeat, clock, origin, surfaces)
         self._wake.set()
         return reminder
 
@@ -203,37 +197,54 @@ class ReminderService:
             return 0
         self.firing = True
         try:
-            messages = await asyncio.gather(*(self._compose(reminder) for reminder in due))
+            written = await asyncio.gather(*(self._compose(reminder) for reminder in due))
             now = self._clock()  # after the writing: that is when the clients get it
             fired = 0
-            for reminder, message in zip(due, messages):
+            for reminder, (message, failure) in zip(due, written):
                 if not self.memory.reminder_exists(reminder.id):  # cancelled while Clara was writing
                     continue
                 following = next_occurrence(reminder, now) if reminder.repeat else None
                 self.memory.fire_reminder(reminder, following, now, message)
                 fired += 1
+                if failure:
+                    self._tell_failure(reminder, failure)
             if fired:
-                self.memory.prune_reminder_events(now - EVENT_RETENTION)
-                for listener in self._listeners:
-                    listener.set()
+                self.notifier.stored()
             return fired
         finally:
             self.firing = False
 
-    async def _compose(self, reminder: Reminder) -> str | None:
+    async def _compose(self, reminder: Reminder) -> tuple[str | None, str]:
+        """(Clara's announcement or None, why she could not write it or "")."""
         if self.composer is None or self.stopping:
-            return None
+            return None, ""
         try:
-            return await self.composer(reminder)
+            return await self.composer(reminder), ""
+        except AnnounceFailed as error:
+            return None, str(error)
         except Exception:
             log.exception("reminders: could not write the announcement of reminder %s", reminder.id)
-            return None
+            return None, "an unexpected error"
+
+    def _tell_failure(self, reminder: Reminder, reason: str) -> None:
+        """The person gets the reminder's own text: say why, on the same surfaces."""
+        try:
+            self.notifier.notify(
+                reminder.person_id,
+                f"Clara could not write the announcement of your reminder ({reason}), so it was shown "
+                f"as you typed it: {reminder.text}",
+                "Reminder",
+                reminder.targets,
+                SERVER,
+                reminder.conversation,
+                limited=False,
+            )
+        except NotificationError:
+            log.exception("reminders: could not tell why reminder %s was announced as typed", reminder.id)
 
     def announce_server(self, state: str) -> None:
         """Tell every connected client what the server is doing ("stopping", "stopped")."""
-        self.server_state = state
-        for listener in self._listeners:
-            listener.set()
+        self.notifier.announce_server(state)
 
     async def run(self) -> None:
         """The scheduler loop; runs for the life of the server."""
@@ -249,34 +260,10 @@ class ReminderService:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), max(0.0, min(delay, MAX_SLEEP)))
 
-    # -- one client's stream ------------------------------------------------------------------- #
+    # -- one listener's stream ----------------------------------------------------------------- #
 
-    async def events(self, client: str) -> AsyncIterator[dict[str, Any]]:
-        """What fires from now on, preceded by what fired since this client last connected, and the
-        state of the server whenever it changes (first of all when the client connects)."""
-        wake = asyncio.Event()
-        self._listeners.add(wake)
-        told = ""
-        try:
-            cursor = self.memory.reminder_cursor(client)
-            if cursor is None:  # first time: no backlog
-                cursor = self.memory.last_reminder_event()
-                self.memory.set_reminder_cursor(client, cursor)
-            while True:
-                wake.clear()  # before reading: an event stored meanwhile is not lost
-                batch = self.memory.reminder_events_after(cursor, BATCH)
-                for event in batch:
-                    yield event_payload(event)
-                    cursor = event.id
-                    self.memory.set_reminder_cursor(client, cursor)
-                if len(batch) == BATCH:
-                    continue
-                state = self.server_state
-                if state != told:
-                    told = state
-                    yield {"type": "server", "state": state, "message": SERVER_MESSAGES[state]}
-                if state == "stopped":
-                    return  # everything was delivered: the connection can close
-                await wake.wait()
-        finally:
-            self._listeners.discard(wake)
+    def events(
+        self, client: str, surface: str | None = None, user_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """See :meth:`Notifier.events`: reminders and notifications go through the same stream."""
+        return self.notifier.events(client, surface, user_id)

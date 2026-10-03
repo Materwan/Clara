@@ -7,7 +7,16 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from clara.client import ClaraApi, Notices, describe_reminder, format_reminder, listen, parse_remind
+from clara.client import (
+    ClaraApi,
+    Notices,
+    describe_reminder,
+    format_event,
+    format_reminder,
+    listen,
+    parse_remind,
+    take_targets,
+)
 
 PARIS = timezone(timedelta(hours=2))
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=PARIS)
@@ -67,7 +76,7 @@ def event(**fields) -> dict:
 
 def test_a_reminder_that_just_fired_is_shown_plainly():
     shown = format_reminder(event(), datetime(2026, 10, 2, 10, 0, 5, tzinfo=timezone.utc))
-    assert "Dentist" in shown and "set by Erwan" in shown
+    assert "Dentist" in shown
     assert "missed" not in shown
 
 
@@ -79,6 +88,36 @@ def test_a_reminder_that_fired_while_away_says_so():
 def test_describe_lists_id_time_repeat_and_text():
     line = describe_reminder({"id": 7, "text": "Bins", "due_at": "2026-10-05T07:00:00+00:00", "repeat": "weekly"})
     assert line.startswith("[7] ") and line.endswith("(weekly)  Bins")
+    line = describe_reminder(
+        {"id": 8, "text": "Bins", "due_at": "2026-10-05T07:00:00+00:00", "repeat": "", "targets": ["app", "cli"]}
+    )
+    assert line.endswith(" @app,cli  Bins")
+
+
+def test_targets_are_an_at_word_before_the_time():
+    assert take_targets("@app,Discord +30m Tea") == (["app", "discord"], "+30m Tea")
+    assert take_targets("daily @app 09:00 Stand-up") == (["app"], "daily 09:00 Stand-up")
+    assert take_targets("+30m Tea with @bob") == ([], "+30m Tea with @bob")  # in the text: not a target
+
+
+def notification(**fields) -> dict:
+    return {
+        "type": "notification",
+        "id": 3,
+        "title": "Answer ready",
+        "text": "Clara has finished.",
+        "sent_at": "2026-10-02T10:00:00+00:00",
+        "source": "server",
+        "targets": [],
+        **fields,
+    }
+
+
+def test_a_notification_shows_its_title_and_text():
+    shown = format_event(notification(), datetime(2026, 10, 2, 10, 0, 5, tzinfo=timezone.utc))
+    assert "Answer ready: Clara has finished." in shown and "sent" not in shown
+    late = format_event(notification(title=""), datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc))
+    assert "🔔 Clara has finished.  (sent " in late
 
 
 def test_reminders_wait_while_a_reply_is_being_printed(capsys):
@@ -94,7 +133,7 @@ def test_reminders_wait_while_a_reply_is_being_printed(capsys):
 def test_the_client_receives_a_reminder_from_a_real_server(live):
     app, url = live
     person = app.state.memory.resolve("cli", "erwan", "Erwan")
-    app.state.memory.set_reminder_cursor("terminal", 0)
+    app.state.memory.set_reminder_cursor("terminal/cli:erwan", 0)
     api = ClaraApi(url, "secret-cli", "erwan", "Erwan", "cli:erwan")
 
     due = (datetime.now().astimezone() + timedelta(days=1)).replace(microsecond=0)
@@ -105,10 +144,13 @@ def test_the_client_receives_a_reminder_from_a_real_server(live):
 
     app.state.memory.add_reminder(person.id, "Announced", datetime.now(timezone.utc))
     asyncio.run(app.state.reminders.fire_due())
+    sent = api.notify("Build finished", targets=["cli"])
+    assert sent["targets"] == ["cli"]
     events = iter(api.reminder_events())
-    first, second = next(events), next(events)  # the backlog, and what the server is doing
+    first, second, third = next(events), next(events), next(events)  # the backlog, then the server's state
     assert first["text"] == "Announced"
-    assert second == {"type": "server", "state": "running", "message": "Clara is running"}
+    assert (second["type"], second["text"], second["source"]) == ("notification", "Build finished", "terminal")
+    assert third == {"type": "server", "state": "running", "message": "Clara is running"}
 
 
 def test_the_message_clara_wrote_is_shown_instead_of_the_reminder_name():

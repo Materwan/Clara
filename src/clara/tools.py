@@ -11,15 +11,30 @@ it in `default_toolbox()`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .memory import Memory, Person
+from .notifications import CLARA, NotificationError, Notifier
 from .reminders import REPEATS, ReminderError, ReminderService
 
 log = logging.getLogger(__name__)
 
 RECALL_LIMIT = 10
+NOTIFY_PER_TURN = 3  # notifications the model may send in one turn
+
+# The surfaces of the clients of this repository, for the model to choose where something is shown
+KNOWN_SURFACES = {
+    "app": "desktop app",
+    "cli": "terminal",
+    "console": "console",
+    "discord": "Discord",
+}
+SURFACES_HELP = (
+    "Where to show it: "
+    + ", ".join(f"{name} ({what})" if name != what else name for name, what in KNOWN_SURFACES.items())
+    + ". Omit: on all of this person's clients."
+)
 
 
 @dataclass(frozen=True)
@@ -31,10 +46,40 @@ class ToolContext:
     surface: str = ""  # where the person is talking from, and in which conversation:
     user_id: str = ""  # a reminder remembers them, to write its announcement there
     conversation: str = ""
+    notifier: Notifier | None = None
+    counts: dict[str, int] = field(default_factory=dict)  # calls of rationed tools in this turn
 
     @property
     def origin(self) -> tuple[str, str, str]:
         return (self.surface, self.user_id, self.conversation)
+
+    def missing_surfaces(self, targets: tuple[str, ...]) -> list[str]:
+        """The targets where this person has no account: nothing would be shown there."""
+        mine = {surface for surface, _ in self.memory.accounts_of(self.person.id)}
+        return [target for target in targets if target not in mine]
+
+
+def _targets(value: Any) -> list[str]:
+    """The model may send a list, a single name or a comma-separated text."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [part for part in value.replace("|", ",").replace(" ", ",").split(",") if part]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    raise ValueError("targets must be a list of surface names.")
+
+
+def _where(context: ToolContext, targets: tuple[str, ...]) -> str:
+    """Where it will be shown, and a warning for the surfaces this person does not use."""
+    shown = f" on {', '.join(targets)}" if targets else " on every client of this person"
+    missing = context.missing_surfaces(targets)
+    if missing:
+        shown += (
+            f". Warning: this person has no account on {', '.join(missing)}, so nothing will be shown "
+            "there until they link one"
+        )
+    return shown
 
 
 @dataclass(frozen=True)
@@ -108,17 +153,21 @@ def _recall_facts(context: ToolContext, query: str) -> str:
     return "\n".join(f"[{fact.id}] {fact.text}" for fact in found)
 
 
-def _remind(context: ToolContext, text: str, when: str, repeat: str = "") -> str:
+def _remind(context: ToolContext, text: str, when: str, repeat: str = "", targets: Any = None) -> str:
     if context.reminders is None:
         raise ValueError("Reminders are not available.")
     try:
         reminder = context.reminders.create(
-            context.person, str(text), str(when), str(repeat or ""), context.timezone, context.origin
+            context.person, str(text), str(when), str(repeat or ""), context.timezone, context.origin,
+            _targets(targets),
         )
     except ReminderError as error:
         raise ValueError(str(error)) from None
     again = f", then {reminder.repeat}" if reminder.repeat else ""
-    return f"Reminder {reminder.id} set for {reminder.due_at.isoformat(timespec='seconds')} (UTC){again}."
+    return (
+        f"Reminder {reminder.id} set for {reminder.due_at.isoformat(timespec='seconds')} (UTC){again}, "
+        f"shown{_where(context, reminder.targets)}."
+    )
 
 
 def _list_reminders(context: ToolContext) -> str:
@@ -128,9 +177,26 @@ def _list_reminders(context: ToolContext) -> str:
     if not found:
         return "No reminder set."
     return "\n".join(
-        f"[{r.id}] {r.due_at.isoformat(timespec='seconds')} (UTC){' ' + r.repeat if r.repeat else ''}: {r.text}"
+        f"[{r.id}] {r.due_at.isoformat(timespec='seconds')} (UTC){' ' + r.repeat if r.repeat else ''}"
+        f" on {', '.join(r.targets) or 'every client'}: {r.text}"
         for r in found
     )
+
+
+def _notify(context: ToolContext, text: str, title: str = "", targets: Any = None) -> str:
+    if context.notifier is None:
+        raise ValueError("Notifications are not available.")
+    sent = context.counts.get("notify", 0)
+    if sent >= NOTIFY_PER_TURN:
+        raise ValueError(f"At most {NOTIFY_PER_TURN} notifications per answer.")
+    try:
+        event = context.notifier.notify(
+            context.person.id, str(text), str(title or ""), _targets(targets), CLARA, context.conversation
+        )
+    except NotificationError as error:
+        raise ValueError(str(error)) from None
+    context.counts["notify"] = sent + 1
+    return f"Notification {event.id} sent{_where(context, event.targets)}."
 
 
 def _cancel_reminder(context: ToolContext, reminder_id: Any) -> str:
@@ -176,8 +242,8 @@ def default_toolbox() -> Toolbox:
             Tool(
                 name="remind",
                 description=(
-                    "Set a reminder: at that time its text is shown on EVERY client connected to Clara, "
-                    "not only this person's, so write it for any reader."
+                    "Set a reminder for the person you are talking to: at that time it is shown to them "
+                    "only, as a notification on the clients you choose."
                 ),
                 function=_remind,
                 parameters={
@@ -187,8 +253,24 @@ def default_toolbox() -> Toolbox:
                         "description": "Local date and time, ISO 8601 without offset: 2026-10-05T09:00.",
                     },
                     "repeat": {"type": "string", "enum": list(REPEATS), "description": "Optional."},
+                    "targets": {"type": "array", "items": {"type": "string"}, "description": SURFACES_HELP},
                 },
                 required=("text", "when"),
+            ),
+            Tool(
+                name="notify",
+                description=(
+                    "Send an instant notification to the person you are talking to: it pops up on their "
+                    "clients even when they are not looking at this conversation. Use it when they asked "
+                    "to be told, or when a long task you were doing is finished; not for ordinary answers."
+                ),
+                function=_notify,
+                parameters={
+                    "text": {"type": "string", "description": "The message, one or two sentences."},
+                    "title": {"type": "string", "description": "Optional short title."},
+                    "targets": {"type": "array", "items": {"type": "string"}, "description": SURFACES_HELP},
+                },
+                required=("text",),
             ),
             Tool(
                 name="list_reminders",

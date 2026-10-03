@@ -1,4 +1,5 @@
-"""Reminders: set by one client, announced to every client, kept for the ones that were away."""
+"""Reminders: set by a person, announced to that person's clients (on the surfaces chosen), kept for the
+ones that were away."""
 
 import asyncio
 import json
@@ -204,8 +205,11 @@ async def nothing_more(stream, wait=0.1):
         await asyncio.wait_for(next_event(stream), wait)
 
 
+CLI = ("terminal", "cli", "erwan")  # a listener: the token's client, and the account it listens as
+
+
 async def test_a_new_client_gets_what_fires_while_it_is_connected(service, clock, erwan):
-    stream = service.events("terminal")
+    stream = service.events(*CLI)
     waiting = asyncio.ensure_future(next_event(stream))
     await asyncio.sleep(0)
     service.create(erwan, "Dentist", at(minutes=5))
@@ -215,24 +219,87 @@ async def test_a_new_client_gets_what_fires_while_it_is_connected(service, clock
     assert event["type"] == "reminder"
     assert event["text"] == "Dentist"
     assert event["from"] == "Erwan"
+    assert event["targets"] == []
     assert event["due_at"] == (NOW + timedelta(minutes=5)).isoformat(timespec="seconds")
     await stream.aclose()
 
 
-async def test_every_connected_client_gets_it(service, clock, erwan):
-    streams = [service.events(name) for name in ("terminal", "discord", "console")]
-    waiting = [asyncio.ensure_future(next_event(s)) for s in streams]
-    await asyncio.sleep(0)
+class Reader:
+    """Reads a stream in the background: what it was sent so far, the state of the server left out."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.events: list[dict] = []
+        self.task = asyncio.ensure_future(self._read())
+
+    async def _read(self):
+        async for event in self.stream:
+            if event["type"] != "server":
+                self.events.append(event)
+
+    @property
+    def texts(self) -> list[str]:
+        return [event["text"] for event in self.events]
+
+    async def close(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
+async def settle():
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+
+
+async def test_every_client_of_the_person_gets_it_and_nobody_else(service, memory, clock, erwan):
+    memory.link_account("app", "erwan-pc", erwan)  # the same person, on the desktop app
+    memory.resolve("cli", "bob", "Bob")
+    listeners = [CLI, ("terminal", "app", "erwan-pc"), ("terminal", "cli", "bob"), ("discord",)]
+    readers = [Reader(service.events(*listener)) for listener in listeners]
+    await settle()
     service.create(erwan, "Meeting", at(minutes=1))
     clock.advance(minutes=1)
     await service.fire_due()
-    assert [e["text"] for e in await asyncio.gather(*waiting)] == ["Meeting"] * 3
-    for stream in streams:
-        await stream.aclose()
+    await settle()
+    assert [reader.texts for reader in readers] == [["Meeting"], ["Meeting"], [], []]
+    for reader in readers:
+        await reader.close()
+
+
+async def test_targets_choose_the_surfaces(service, memory, clock, erwan):
+    memory.link_account("app", "erwan-pc", erwan)
+    on_cli, on_app = Reader(service.events(*CLI)), Reader(service.events("terminal", "app", "erwan-pc"))
+    await settle()
+    reminder = service.create(erwan, "On the desktop", at(minutes=1), targets=["APP", "app"])
+    assert reminder.targets == ("app",)
+    clock.advance(minutes=1)
+    await service.fire_due()
+    await settle()
+    assert [(e["text"], e["targets"]) for e in on_app.events] == [("On the desktop", ["app"])]
+    assert on_cli.events == []
+    for reader in (on_cli, on_app):
+        await reader.close()
+
+
+def test_bad_targets_are_refused(service, erwan):
+    with pytest.raises(ReminderError, match="surface"):
+        service.create(erwan, "Nope", at(minutes=1), targets=["not a surface!"])
+
+
+async def test_an_account_linked_later_gets_what_comes_after(service, memory, clock, erwan):
+    on_app = Reader(service.events("terminal", "app", "erwan-pc"))  # not linked yet: nobody's
+    await settle()
+    memory.link_account("app", "erwan-pc", erwan)
+    service.create(erwan, "Linked", at(minutes=1))
+    clock.advance(minutes=1)
+    await service.fire_due()
+    await settle()
+    assert on_app.texts == ["Linked"]
+    await on_app.close()
 
 
 async def test_a_client_that_was_away_gets_what_it_missed_once(service, clock, erwan):
-    first = service.events("terminal")
+    first = service.events(*CLI)
     waiting = asyncio.ensure_future(next_event(first))
     await asyncio.sleep(0)  # connected: the cursor exists
     waiting.cancel()  # disconnected
@@ -243,11 +310,11 @@ async def test_a_client_that_was_away_gets_what_it_missed_once(service, clock, e
     clock.advance(minutes=1)
     await service.fire_due()  # nobody is connected
 
-    back = service.events("terminal")
+    back = service.events(*CLI)
     assert sorted([(await next_event(back))["text"], (await next_event(back))["text"]]) == ["one", "two"]
     await nothing_more(back)
 
-    again = service.events("terminal")  # it already has them
+    again = service.events(*CLI)  # it already has them
     await nothing_more(again)
     await again.aclose()
 
@@ -257,7 +324,7 @@ async def test_a_client_seeing_the_server_for_the_first_time_gets_no_backlog(ser
     clock.advance(minutes=1)
     await service.fire_due()
 
-    stream = service.events("brand-new")
+    stream = service.events("brand-new", "cli", "erwan")
     await nothing_more(stream)
     await stream.aclose()
 
@@ -265,7 +332,7 @@ async def test_a_client_seeing_the_server_for_the_first_time_gets_no_backlog(ser
 async def test_the_scheduler_fires_a_reminder_set_while_it_sleeps(memory, erwan):
     real = ReminderService(memory)  # the real clock
     runner = asyncio.create_task(real.run())
-    stream = real.events("terminal")
+    stream = real.events(*CLI)
     waiting = asyncio.ensure_future(next_event(stream))
     await asyncio.sleep(0.05)
     soon = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
@@ -374,9 +441,20 @@ def test_http_needs_a_token_and_respects_the_surface_limits(settings):
         assert http.post("/v1/reminders", json=discord, headers=AUTH).status_code == 403
 
 
-def first_event(url: str, headers: dict) -> dict:
-    with httpx.stream("GET", f"{url}/v1/reminders/stream", headers=headers, timeout=10) as response:
+def first_event(url: str, headers: dict, params: dict | None = None, path: str = "/v1/reminders/stream") -> dict:
+    """The first event of a stream that is not the state of the server."""
+    with httpx.stream("GET", f"{url}{path}", headers=headers, params=params, timeout=10) as response:
         assert response.headers["content-type"].startswith("text/event-stream")
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                event = json.loads(line[6:])
+                if event["type"] != "server":
+                    return event
+    raise AssertionError("the stream ended without an event")
+
+
+def server_state(url: str, headers: dict) -> dict:
+    with httpx.stream("GET", f"{url}/v1/notifications/stream", headers=headers, timeout=10) as response:
         for line in response.iter_lines():
             if line.startswith("data: "):
                 return json.loads(line[6:])
@@ -386,23 +464,38 @@ def first_event(url: str, headers: dict) -> dict:
 def test_http_stream_sends_what_a_client_missed(live):
     app, url = live
     person = app.state.memory.resolve("cli", "erwan", "Erwan")
-    app.state.memory.set_reminder_cursor("terminal", 0)  # "terminal" has connected before
+    app.state.memory.set_reminder_cursor("terminal/cli:erwan", 0)  # this listener has connected before
     app.state.memory.add_reminder(person.id, "Missed", NOW)  # already due
     asyncio.run(app.state.reminders.fire_due())
 
-    event = first_event(url, AUTH)
+    event = first_event(url, AUTH, ME)
 
     assert (event["type"], event["text"], event["from"]) == ("reminder", "Missed", "Erwan")
 
 
-def test_http_stream_gives_every_client_the_reminder(live):
+def test_http_stream_is_for_the_person_who_set_it(live):
     app, url = live
-    person = app.state.memory.resolve("cli", "erwan", "Erwan")
-    for name in ("terminal", "discord"):
-        app.state.memory.set_reminder_cursor(name, 0)
-    app.state.memory.add_reminder(person.id, "For all", NOW)
+    memory = app.state.memory
+    person = memory.resolve("cli", "erwan", "Erwan")
+    memory.resolve("cli", "bob", "Bob")
+    for listener in ("terminal/cli:erwan", "discord/cli:bob"):
+        memory.set_reminder_cursor(listener, 0)
+    memory.add_reminder(person.id, "Only mine", NOW)
+    memory.add_notification(None, "For everybody", NOW)
     asyncio.run(app.state.reminders.fire_due())
 
-    texts = [first_event(url, {"Authorization": f"Bearer secret-{name}"})["text"] for name in ("cli", "discord")]
+    mine = first_event(url, AUTH, ME, "/v1/notifications/stream")
+    bobs = first_event(url, {"Authorization": "Bearer secret-discord"}, {"surface": "cli", "user_id": "bob"})
 
-    assert texts == ["For all", "For all"]
+    assert (mine["type"], mine["text"]) == ("notification", "For everybody")  # older: it comes first
+    assert (bobs["type"], bobs["text"]) == ("notification", "For everybody")  # not erwan's reminder
+
+
+def test_http_stream_without_an_account_only_says_how_the_server_is(live):
+    _, url = live
+    assert server_state(url, AUTH) == {"type": "server", "state": "running", "message": "Clara is running"}
+
+
+def test_http_stream_needs_both_parts_of_the_account(client):
+    response = client.get("/v1/notifications/stream", params={"surface": "cli"}, headers=AUTH)
+    assert response.status_code == 422

@@ -31,16 +31,20 @@ HELP = """\
 /link <surface> <id> <code>
                   tell Clara that account (e.g. discord 1234) is you too; <code> is
                   the one that account's own client gave it with its /linkcode
-/remind [daily|weekly|monthly] <when> <text>
-                  a notification on EVERY connected Clara client at that time.
+/remind [daily|weekly|monthly] [@surfaces] <when> <text>
+                  a notification for you, on your clients, at that time.
                   <when>: +30m, +2h, +3d | 09:30 | tomorrow 09:30 | 2026-10-05 09:30
+                  @surfaces: only on those, e.g. @app or @app,discord (default: all of yours)
 /reminders        your reminders that have not fired yet
 /unremind <id>    cancel one of them
+/notify [@surfaces] <text>
+                  send yourself a notification now (e.g. to try your other clients)
 /new              start a fresh conversation thread (facts are kept)
 /quit             leave"""
 
 REPEATS = ("daily", "weekly", "monthly")
 LATE_SECONDS = 120  # a reminder shown this long after it fired is announced as missed
+SHOWN = ("reminder", "notification", "server")  # the events of the stream this client shows
 
 
 class ClaraApi:
@@ -107,7 +111,8 @@ class ClaraApi:
     def new_thread(self) -> None:
         self.http.delete(f"/v1/conversations/{self.conversation}").raise_for_status()
 
-    def add_reminder(self, at: datetime, text: str, repeat: str) -> dict:
+    def add_reminder(self, at: datetime, text: str, repeat: str, targets: list[str] | None = None) -> dict:
+        """A reminder for this user, shown on the surfaces in `targets` (empty: on all of theirs)."""
         response = self.http.post(
             "/v1/reminders",
             json={
@@ -116,7 +121,17 @@ class ClaraApi:
                 "text": text,
                 "repeat": repeat,
                 "at": at.isoformat(timespec="seconds"),
+                "targets": targets or [],
             },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def notify(self, text: str, title: str = "", targets: list[str] | None = None) -> dict:
+        """Send this user a notification now, on the surfaces in `targets` (empty: on all of theirs)."""
+        response = self.http.post(
+            "/v1/notifications",
+            json={**self.identity(), "user_name": self.name, "text": text, "title": title, "targets": targets or []},
         )
         response.raise_for_status()
         return response.json()
@@ -130,22 +145,22 @@ class ClaraApi:
         self.http.delete(f"/v1/reminders/{reminder_id}", params=self.identity()).raise_for_status()
 
     def reminder_events(self) -> Iterator[dict]:
-        """What the server announces, for as long as the connection holds: `reminder` events (the ones
-        missed while away first) and `server` events (its state: running, stopping, stopped). It has its
-        own connection, so a background thread can run it."""
+        """What the server announces to this user, for as long as the connection holds: `reminder` and
+        `notification` events (the ones missed while away first) and `server` events (its state: running,
+        stopping, stopped). It has its own connection, so a background thread can run it."""
         with (
             httpx.Client(
                 base_url=str(self.http.base_url),
                 headers=self.http.headers,
                 timeout=httpx.Timeout(10.0, read=60.0),  # the server sends a keepalive every 15 s
             ) as http,
-            http.stream("GET", "/v1/reminders/stream") as response,
+            http.stream("GET", "/v1/notifications/stream", params=self.identity()) as response,
         ):
             response.raise_for_status()
             for line in response.iter_lines():
                 if line.startswith("data: "):
                     event = json.loads(line[6:])
-                    if event.get("type") in ("reminder", "server"):
+                    if event.get("type") in SHOWN:
                         yield event
 
 
@@ -154,6 +169,16 @@ def _clock(text: str) -> tuple[int, int]:
     if not match or int(match[1]) > 23 or int(match[2]) > 59:
         raise ValueError(f"Not a time of day: {text!r} (use HH:MM).")
     return int(match[1]), int(match[2])
+
+
+def take_targets(argument: str) -> tuple[list[str], str]:
+    """`(surfaces, the rest)`: an `@app,discord` word among the first two says where to show it."""
+    words = argument.split()
+    for index, word in enumerate(words[:2]):
+        if word.startswith("@"):
+            del words[index]
+            return [name for name in word[1:].lower().split(",") if name], " ".join(words)
+    return [], argument
 
 
 def parse_remind(argument: str, now: datetime) -> tuple[datetime, str, str]:
@@ -196,14 +221,25 @@ def local(moment: str) -> str:
 
 def describe_reminder(reminder: dict) -> str:
     again = f" ({reminder['repeat']})" if reminder["repeat"] else ""
-    return f"[{reminder['id']}] {local(reminder['due_at'])}{again}  {reminder['text']}"
+    where = f" @{','.join(reminder['targets'])}" if reminder.get("targets") else ""
+    return f"[{reminder['id']}] {local(reminder['due_at'])}{again}{where}  {reminder['text']}"
 
 
 def format_reminder(event: dict, now: datetime) -> str:
     missed = (now - datetime.fromisoformat(event["fired_at"])).total_seconds() > LATE_SECONDS
     late = f"  (missed, it was due {local(event['due_at'])})" if missed else ""
-    author = f"  (set by {event['from']})" if event.get("from") else ""
-    return f"\a⏰ {event.get('message') or event['text']}{late}{author}"
+    return f"\a⏰ {event.get('message') or event['text']}{late}"
+
+
+def format_notification(event: dict, now: datetime) -> str:
+    late = (now - datetime.fromisoformat(event["sent_at"])).total_seconds() > LATE_SECONDS
+    when = f"  (sent {local(event['sent_at'])})" if late else ""
+    title = f"{event['title']}: " if event.get("title") else ""
+    return f"\a🔔 {title}{event['text']}{when}"
+
+
+def format_event(event: dict, now: datetime) -> str:
+    return (format_notification if event["type"] == "notification" else format_reminder)(event, now)
 
 
 class Notices:
@@ -216,7 +252,7 @@ class Notices:
         self._waiting: list[str] = []
 
     def show(self, event: dict) -> None:
-        self.say(format_reminder(event, datetime.now().astimezone()))
+        self.say(format_event(event, datetime.now().astimezone()))
 
     def say(self, text: str) -> None:
         with self._lock:
@@ -248,8 +284,8 @@ SERVER_SAYS = {
 
 
 def listen(api: ClaraApi, notices: Notices, stop: threading.Event, pause: float = 5.0) -> None:
-    """Show every reminder the server announces, and say when the server stops, is gone or is back;
-    when the connection drops, try again."""
+    """Show every reminder and notification the server announces, and say when the server stops, is gone
+    or is back; when the connection drops, try again."""
     state = ""  # "running", "stopping" or "down"; "" before the first answer
 
     def change(new: str) -> None:
@@ -303,13 +339,19 @@ def command(api: ClaraApi, line: str) -> bool:
         surface, external_id, code = argument.split()
         print("Accounts: " + ", ".join(api.link(surface, external_id, code)))
     elif name == "/remind":
+        targets, argument = take_targets(argument)
         try:
             due, repeat, text = parse_remind(argument, datetime.now().astimezone())
         except ValueError as error:
             print(error)
             return True
-        reminder = api.add_reminder(due, text, repeat)
-        print(f"Reminder {reminder['id']} set for {local(reminder['due_at'])}: every connected client will see it.")
+        reminder = api.add_reminder(due, text, repeat, targets)
+        where = ", ".join(reminder.get("targets") or []) or "all your clients"
+        print(f"Reminder {reminder['id']} set for {local(reminder['due_at'])}, shown on {where}.")
+    elif name == "/notify" and take_targets(argument)[1]:
+        targets, text = take_targets(argument)
+        sent = api.notify(text, targets=targets)
+        print(f"Sent, shown on {', '.join(sent['targets']) or 'all your clients'}.")
     elif name == "/reminders":
         print("\n".join(describe_reminder(r) for r in api.reminders()) or "(none)")
     elif name == "/unremind" and argument.isdigit():

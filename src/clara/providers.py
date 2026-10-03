@@ -18,12 +18,15 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable
+from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
 from .llm import LlmBackend, LlmChunk, OllamaBackend
 from .settings import Settings
+from .traffic import TrafficLog
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 CHECK_TIMEOUT = 8.0
 
@@ -105,6 +108,7 @@ class ProviderManager:
         self.configs = configs
         self.state_path = state_path
         self._factory = factory
+        self.traffic: TrafficLog | None = None  # where the calls to the provider are logged
         self._models = {name: config.default_model for name, config in configs.items()}
         self.active = default
         self._load_state()
@@ -197,16 +201,29 @@ class ProviderManager:
     # ------------------------------------------------------------------
     # LlmBackend: delegate to the active provider
     # ------------------------------------------------------------------
+    @property
+    def peer(self) -> str:
+        """The provider, as named in the traffic log."""
+        return f"ollama:{self.active}"
+
     def stream(self, messages: list[dict], tools: list[dict] | None) -> AsyncIterator[LlmChunk]:
-        return self._backend.stream(messages, tools)
+        stream = self._backend.stream(messages, tools)
+        if self.traffic is None:
+            return stream
+        return self.traffic.model_stream(stream, self.peer, self.config.host, self.model, messages, tools)
+
+    def _logged(self, operation: str, call: Awaitable[T]) -> Awaitable[T]:
+        if self.traffic is None:
+            return call
+        return self.traffic.model_call(operation, self.peer, self.config.host, call)
 
     async def list_models(self) -> list[str]:
-        return await asyncio.wait_for(self._backend.list_models(), CHECK_TIMEOUT)
+        return await asyncio.wait_for(self._logged("list_models", self._backend.list_models()), CHECK_TIMEOUT)
 
     async def check(self) -> str | None:
         """None if the active provider is usable (reachable, key accepted), else a short reason."""
         try:
-            await asyncio.wait_for(self._backend.verify(), CHECK_TIMEOUT)
+            await asyncio.wait_for(self._logged("verify", self._backend.verify()), CHECK_TIMEOUT)
         except asyncio.TimeoutError:
             return "no answer"
         except Exception as error:

@@ -111,18 +111,23 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 | `POST /v1/chat` | `{surface, user_id, user_name?, message, conversation?}` → `{reply, conversation, person, tools, usage}`; 413 if it cannot fit the model's window, 504 if the model hangs, 503 if the server is stopping |
 | `POST /v1/chat/stream` | same body; Server-Sent Events `turn` / `token` / `tool` / `tool_requests` / `usage` / `compacted` / `warning` / `done` / `error` |
 | `POST /v1/turns/{id}/tool-results` | `{results: [{id, content}]}`: a client's answer to a `tool_requests` event (see below) |
+| `GET /v1/conversations?surface=&user_id=&q=&limit=` | `{conversations: [{id, title, titled_by, pinned, created_at, updated_at, preview}]}`: the conversations the account's person started on that surface, pinned first, then the last written in; `q` keeps those whose title, messages or summary contain it (see *Conversation history*) |
+| `GET /v1/conversations/{id}/messages?surface=&user_id=&limit=` | the same fields, and `{messages: [{id, role, content, created_at}], summary, earlier}`: its last questions and answers (200), to show it again |
+| `PATCH /v1/conversations/{id}` | `{surface, user_id, title?, pinned?}`: rename (`""`: no title) and/or pin |
+| `POST /v1/conversations/{id}/title` | `{surface, user_id}` → `{id, title}`: Clara writes its title if it has none; 409 nothing to title yet, 502 the model failed |
 | `GET /v1/conversations/{id}` | `{tokens, window, percent, summary, messages}`: how full the context is |
 | `POST /v1/conversations/{id}/compact` | `{focus?}` → `{before_percent, after_percent, summary}`: summarise the older messages |
 | `GET /v1/memory/facts?surface=&user_id=` | list a person's facts |
 | `POST /v1/memory/facts` | `{surface, user_id, text}` |
 | `DELETE /v1/memory/facts/{id}?surface=&user_id=` | |
-| `POST /v1/reminders` | `{surface, user_id, user_name?, text, at, repeat?, timezone?, conversation?}` → `{id, text, due_at, repeat}`; 422 if `at` is past or not ISO 8601 (see *Reminders*); `conversation` (default: the account's own) is where Clara writes the announcement |
+| `POST /v1/reminders` | `{surface, user_id, user_name?, text, at, repeat?, timezone?, conversation?, targets?}` → `{id, text, due_at, repeat, targets}`; 422 if `at` is past or not ISO 8601 (see *Reminders*); `conversation` (default: the account's own) is where Clara writes the announcement; `targets`: the surfaces it is shown on (default: all of the person's) |
 | `GET /v1/reminders?surface=&user_id=` | the person's reminders that have not fired yet |
 | `DELETE /v1/reminders/{id}?surface=&user_id=` | cancel one of the person's own reminders |
-| `GET /v1/reminders/stream` | Server-Sent Events: `reminder` when one comes due (**every client** gets every reminder, with the message Clara wrote) and `server` (running, stopping, stopped) |
+| `POST /v1/notifications` | `{surface, user_id, user_name?, text, title?, targets?, conversation?}` → `{id, sent_at, targets}`: notify that person now (see *Notifications*); 429 when too many |
+| `GET /v1/notifications/stream?surface=&user_id=` | Server-Sent Events of that account: its person's `reminder` and `notification` events for that surface, and `server` (running, stopping, stopped). Also served as `/v1/reminders/stream` |
 | `POST /v1/accounts/link-code` | `{surface, user_id}` → `{code, expires_in}`: proof of control of that account |
 | `POST /v1/accounts/link` | `{surface, user_id, code, to_surface, to_user_id}`; 403 bad code, 409 both accounts have memories |
-| `DELETE /v1/conversations/{id}` | forget a thread, keep the facts |
+| `DELETE /v1/conversations/{id}?surface=&user_id=` | forget a thread, keep the facts; with an account, only one its person started (404 otherwise) |
 | `GET /health` | no auth; shows the active provider and model |
 | `GET /v1/admin/commands`, `POST /v1/admin/command` | `{line}` → `{output, quit}`; **admin token** only (used by `clara-admin`) |
 
@@ -131,6 +136,27 @@ client such as a Discord channel should pass its own id (`discord:channel:42`);
 messages from other people in that thread reach the model prefixed with their name.
 
 Interactive docs: `http://127.0.0.1:8765/docs`.
+
+### Conversation history
+
+The server keeps a list of conversations, so that a client can show them as other chat apps do (the desktop app
+has it at the side of its window). A conversation joins the list with its first turn: who started it (the
+person), the surface it was started on (the start of its id, `app` in `app:erwan:4f2a…`), and when it was last
+written in. Conversations from before this list existed are not in it; their messages stay where they were.
+
+- **Listing** is per person and surface: `GET /v1/conversations?surface=app&user_id=erwan` gives what that
+  account's person started in the app, not their terminal or Discord conversations. Each comes with the start
+  of its first message (`preview`), for those without a title yet.
+- **Reading one back** (`/messages`) gives its questions and answers, not the tool calls and their results.
+  When older messages were deleted after a compaction (`CLARA_PURGE_SUMMARISED`), the summary that stands for
+  them comes with it.
+- **Titles**: a client asks for one after an answer (`POST .../title`). Clara writes 3 to 6 words from the
+  first question and answer (or from the summary), in a separate model call that is not stored in the
+  conversation. A title given by the person (`PATCH`) is never replaced; an empty one lets Clara title it again.
+- **Search** (`q`) looks in titles, the questions and answers, and summaries; case is ignored for ASCII
+  letters only (SQLite).
+- **Only its person** can list, read, rename, pin or title a conversation, or delete it when the request
+  names an account. `CLARA_CLIENT_SURFACES` applies as everywhere.
 
 ### Tools that run on the client
 
@@ -169,7 +195,7 @@ reuse its cache of them.
 ### Privacy
 
 `/forget-person <person> confirm` erases a person: their accounts, facts and messages. A conversation only they
-took part in goes entirely, answers and summary included. In a conversation shared with other people only their own
+took part in goes entirely, answers, summary and title included. In a conversation shared with other people only their own
 messages go, and the answers and summary that remain may still mention them. Messages are kept after a compaction
 (the summary stands for them) unless `CLARA_PURGE_SUMMARISED=true`, which deletes them: the summary, which can
 contain personal data too, is then the only record. There is no retention limit otherwise.
@@ -210,47 +236,111 @@ with httpx.stream("POST", "http://127.0.0.1:8765/v1/chat/stream",
 
 ## Reminders
 
-A reminder is a text and a moment. When the moment comes, the server announces it to **every client**,
-whoever set it and whichever surface they speak for (`CLARA_CLIENT_SURFACES` does not apply: a reminder
-is a broadcast, so the person setting one should know that everybody will read it).
+A reminder is a text and a moment. When the moment comes, the server announces it **to the person who set
+it, and nobody else**: on every client of theirs, or only on the *surfaces* the reminder names (`targets`:
+`app`, `cli`, `console`, `discord`...). "Their clients" means every account linked to that person (see
+*How the memory works*): a reminder set in the terminal reaches the desktop app only once `app:<you>` and
+`cli:<you>` are the same person.
 
 - **Setting one.** `POST /v1/reminders` with `at` as ISO 8601: `2026-10-05T09:00+02:00`, or without an
   offset (`2026-10-05T09:00`), read in `timezone` (an IANA name) or else the server's own timezone.
   `repeat` is `daily`, `weekly` or `monthly`: the same wall-clock time again, and the same day of the
   month, clamped to the month's length (the 31st is the 28th in February, then the 31st again). With a
-  `timezone` a repeat follows daylight saving; with only an offset it keeps that offset. The model can do
-  it too (`remind`, `list_reminders`, `cancel_reminder`; it reads `when` in the request's `timezone`),
-  and `clara-chat` and the console have `/remind`. At most 100 per person, 500 characters each.
+  `timezone` a repeat follows daylight saving; with only an offset it keeps that offset. `targets` is a
+  list of surfaces (empty: all of them). The model can do it too (`remind`, `list_reminders`,
+  `cancel_reminder`; it reads `when` in the request's `timezone`) and **chooses the surfaces itself**
+  (`targets`; it is warned when the person has no account on one). `clara-chat` and the console have
+  `/remind [daily] [@app,discord] <when> <text>`. At most 100 per person, 500 characters each.
 - **Clara writes the announcement.** When a reminder comes due, the server has Clara write the message that
   is shown, instead of just the reminder's text: an ordinary turn in the conversation where the reminder was
-  set, as the person who set it. She knows what she knows about them, the exchange (`[Reminder due] …` and her
-  answer) is kept in their history, and she is told that everybody connected will read it. She has no tools in
-  that turn, so a reminder cannot create reminders. One message is written, the same for every client. If she
-  cannot write it within `CLARA_REMINDER_AI_TIMEOUT` seconds (60; the model is down or slow), or the reminder
-  was set before the server kept where, the reminder's own text is announced. `0` turns this off.
-  **Mind that** what she writes may draw on the author's private facts and goes to every client.
-- **Receiving them.** A client opens `GET /v1/reminders/stream` and keeps it open (a `: keepalive` comment
-  every 15 s; reconnect when it drops). An event is either
-  `{"type": "reminder", "id", "text", "message", "due_at", "fired_at", "from"}` (UTC times; `from` is who set
-  it; **show `message`**, which is what Clara wrote, or `text` when `message` is null), or
-  `{"type": "server", "state", "message"}`, the state of the server (see *Stopping the server*).
-- **Missing the moment.** Announced reminders are stored for 7 days, and the server remembers how far each
-  *client* (each token) has read. A client that connects after a reminder fired is sent what it missed,
-  oldest first, and tells the user: compare `fired_at` with the clock. A client the server has never seen
-  starts from now, with no backlog. A reminder is delivered at least once: if the connection drops while
-  it is being sent, it comes again on reconnection. Two connections made with the same token both get
-  what fires while they are open, but share what they missed.
+  set, as the person who set it. She knows what she knows about them, and the exchange (`[Reminder due] …` and
+  her answer) is kept in their history. She has no tools in that turn, so a reminder cannot create reminders.
+  If she cannot write it within `CLARA_REMINDER_AI_TIMEOUT` seconds (60; the model is down or slow), the
+  reminder's own text is announced and **a notification tells the person why**. A reminder set before the
+  server kept where is announced as typed. `0` turns this off.
+- **Receiving them** is the event stream of *Notifications* below: a reminder arrives as
+  `{"type": "reminder", "id", "text", "message", "due_at", "fired_at", "from", "targets"}` (UTC times;
+  **show `message`**, which is what Clara wrote, or `text` when `message` is null).
 - **The server was down** at the moment: the reminder fires when it is back. A repeating one that missed
   several occurrences fires once, then waits for its next.
 - **Privacy.** `/forget-person` also erases the person's reminders and what they announced. Only the person
   who set a reminder can list or cancel it.
+
+## Notifications
+
+A notification is a message pushed to a person's clients **now**: a pop-up in the desktop app, a line with
+a bell in `clara-chat` and in the console. Like a reminder, it is for one person (on all their surfaces,
+or the ones in `targets`). Three kinds of senders:
+
+| Who | How | `source` |
+| --- | --- | --- |
+| **Clara** | her `notify` tool (`text`, `title?`, `targets?`), e.g. when a long task is done; at most 3 per answer | `clara` |
+| **a client** | `POST /v1/notifications` `{surface, user_id, text, title?, targets?, conversation?}` → `{id, sent_at, targets}` (the person of `surface:user_id`; 422 invalid, 429 too many) | the client's name in `CLARA_TOKENS` |
+| **the server** | by itself, see below | `server` |
+
+The server notifies when:
+
+- **a turn took long**: one that lasted `CLARA_NOTIFY_LONG_TURN` seconds or more (120; `0`: never) tells its
+  person it is done, with the start of the answer (not for sub-agents, nor for reminder announcements);
+- **a conversation was summarised** (automatically or on demand): its person is told how full the context
+  was and is now, on the conversation's surface. A conversation with several people (a Discord channel) tells
+  nobody;
+- **a reminder could not be written by Clara** (see *Reminders*);
+- **the provider or the model changed** (`/provider`, `/model`): this one is for **everybody**.
+
+A person may be sent at most 10 notifications a minute by Clara and the clients (the server's own are not
+counted); texts are at most 2000 characters, titles 100.
+
+### The event stream
+
+A client opens `GET /v1/notifications/stream?surface=<its surface>&user_id=<the user>` and keeps it open (a
+`: keepalive` comment every 15 s; reconnect when it drops). It gets, for **that account's person and that
+surface**:
+
+- `{"type": "reminder", ...}`, see *Reminders*;
+- `{"type": "notification", "id", "title", "text", "sent_at", "source", "targets", "conversation", "everyone"}`
+  (`conversation`: what it is about, if anything; a client showing that conversation may skip the pop-up);
+- `{"type": "server", "state", "message"}`: the state of the server (see *Stopping the server*).
+
+Without `surface` and `user_id`, a stream only gets the state of the server and what is for everybody.
+`CLARA_CLIENT_SURFACES` applies: a client listens only as an account of its own surfaces (403 otherwise).
+`GET /v1/reminders/stream` is the same stream, under its earlier name.
+
+**Missing the moment.** Events are stored for 7 days, and the server remembers how far each *listener* (a
+token + an account) has read. A listener that connects after something fired is sent what it missed,
+oldest first: compare `fired_at` / `sent_at` with the clock. A listener the server has never seen starts
+from now, with no backlog. An event is delivered at least once: if the connection drops while it is being
+sent, it comes again on reconnection. Two connections of the same listener both get what fires while they
+are open, but share what they missed.
+
+## Traffic log
+
+Every request that comes in or goes out is written to `data/logs/traffic-<date>.jsonl` (one file per UTC day,
+one JSON object per line). Entries of one exchange share an `id`:
+
+| `dir` | `kind` | what |
+| --- | --- | --- |
+| `in` | `request` | a client's HTTP request: `peer` (`client:<name>`, `admin:<name>`, `anonymous`, `unknown-token`), method, path, query, address, body |
+| `out` | `response` | its answer: status, body, duration, bytes, `outcome` (`complete`, or why it was cut) |
+| `out` | `sse` | each event sent on a stream (a turn, the event stream). The pieces of an answer (`token`) are only counted in the `response`: the `done` event holds the whole answer |
+| `out` | `llm_request` / `llm_response` | each call to the model: provider (`peer` = `ollama:local` or `ollama:cloud`), host, model, the messages and tools sent; then the text, tool calls, token counts, duration and error |
+| `out` | `llm_call` | the other calls to the provider: listing its models, checking the API key |
+
+Never written: the bearer tokens (only the client's name), the API key, and the values of fields called
+`code`, `token`, `password`, `api_key`... (a link code, for instance). Bodies are cut at
+`CLARA_TRAFFIC_LOG_MAX_BODY` characters (100 000). Files older than `CLARA_TRAFFIC_LOG_DAYS` (30) are deleted;
+`CLARA_TRAFFIC_LOG=false` turns the log off. The writing happens in a background thread.
+
+**Mind that** the log holds everything people say and, through the prompts, what Clara knows about them:
+`/forget-person` does **not** erase it. Read it with any JSON tool, e.g.
+`jq 'select(.kind=="llm_response") | .text' data/logs/traffic-2026-10-02.jsonl`.
 
 ## Stopping the server
 
 `/stop` (in the server's console, or `clara-admin /stop` from another computer with an admin token),
 Ctrl+C or SIGTERM stop the server **without cutting anybody off**:
 
-1. every client connected to `GET /v1/reminders/stream` is told: `{"type": "server", "state": "stopping"}`
+1. every client connected to `GET /v1/notifications/stream` is told: `{"type": "server", "state": "stopping"}`
    (a client that connects meanwhile is told at once);
 2. new questions are refused with **HTTP 503** (`Clara is stopping and takes no new question`), and so are
    new compactions; reminders that come due wait for the next start;
@@ -301,19 +391,22 @@ See `deploy/clara.service` (systemd). Ollama must be reachable from the server
 ```
 src/clara/
   settings.py   environment configuration
-  memory.py     SQLite: people, accounts, facts, history
+  memory.py     SQLite: people, accounts, facts, history, the list of conversations
   linking.py    single-use codes that prove control of an account before it is linked
   llm.py        LlmBackend interface + Ollama implementation
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
-  reminders.py  reminders: parsing, repeats, the scheduler, each client's stream of announcements
+  reminders.py  reminders: parsing, repeats, the scheduler
+  notifications.py  notifications, and each listener's stream of events (reminders, notifications, server state)
+  announce.py   Clara writes the announcement of a reminder that came due
+  traffic.py    the traffic log: every request in and out, in data/logs
   prompt.py     personality file + per-request context
-  agent.py      one conversation turn (locks, server and client tools, streaming, storage, compaction)
+  agent.py      one conversation turn (locks, server and client tools, streaming, storage, compaction), titles
   compaction.py transcript and summary request for long conversations
   commands.py   the console commands (/provider, /status...), shared by both consoles
   console.py    the interactive prompt (history, completion)
   server.py     FastAPI routes, auth, embedded console
-  client.py     clara-chat (also shows reminders, and has /remind)
+  client.py     clara-chat (also shows reminders and notifications, and has /remind and /notify)
   admin.py      clara-admin (remote console)
 config/system_prompt.md   Clara's personality, re-read when edited
 ```

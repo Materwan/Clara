@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+import time
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -36,6 +38,7 @@ from .compaction import (
 )
 from .llm import LlmBackend, LlmChunk
 from .memory import ConversationState, Fact, Memory, Person, StoredMessage, TurnRow
+from .notifications import SERVER, SURFACE_RE, NotificationError, Notifier
 from .prompt import SystemPrompt
 from .reminders import ReminderService
 from .tools import Toolbox, ToolContext
@@ -51,6 +54,24 @@ DEFAULT_CONTEXT_WINDOW = 32_768
 PROMPT_LIMIT = 0.95  # share of the window a prompt may fill; beyond, the model would truncate it silently
 ROUND_SEPARATOR = "\n\n"  # between the texts of two model rounds
 MAX_MESSAGE_SHARE = 0.5  # share of the window a single new message may take
+NOTIFIED_REPLY = 200  # characters of the answer quoted in the notification of a long turn
+TITLE_EXCERPT = 1_500  # characters of the first question, and of the first answer, a title is written from
+TITLE_LENGTH = 60
+TITLE_INSTRUCTIONS = (
+    "Write a title for the conversation below: 3 to 6 words saying what it is about, in the language it "
+    "is written in. Answer with the title alone: no quotes, no full stop, no comment."
+)
+
+
+def clean_title(text: str) -> str:
+    """The title a model wrote, as it is shown: one line, no quotes or "Title:", no full stop, not too long."""
+    line = next((line for line in text.splitlines() if line.strip()), "")
+    line = re.sub(r"^\s*#*\s*", "", line)
+    line = re.sub(r"^(?:\*\*)?(?:title|titre)\s*:\s*", "", line, flags=re.IGNORECASE)
+    line = " ".join(line.strip().strip("*_`\"'«»“”‘’").split()).rstrip(" .:;!")
+    if len(line) > TITLE_LENGTH:
+        line = line[:TITLE_LENGTH].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+    return line
 
 
 def now_in(timezone: str | None) -> datetime:
@@ -72,6 +93,10 @@ class ModelTimeout(Exception):
 
 class PromptTooLarge(Exception):
     """What must be sent to the model does not fit in its context window."""
+
+
+class NothingToTitle(Exception):
+    """The conversation is not listed, or has nothing a title could be written from."""
 
 
 class ServerStopping(Exception):
@@ -119,6 +144,7 @@ class ChatRequest:
     ephemeral: bool = False  # a one-shot job: no persona, no memory, nothing stored
     timezone: str | None = None  # IANA name for the date and time shown to the model (default: the server's)
     no_tools: bool = False  # the server's own tools are not offered (the model can only write)
+    quiet: bool = False  # never notify the person about this turn (it is itself an announcement)
 
     @property
     def conversation_id(self) -> str:
@@ -153,9 +179,13 @@ class Agent:
         idle_timeout: float = 120.0,
         clock: Callable[[str | None], datetime] = now_in,
         reminders: ReminderService | None = None,
+        notifier: Notifier | None = None,
+        long_turn_seconds: float = 0.0,
     ):
         self.memory = memory
         self.reminders = reminders  # lets the model's tools set reminders
+        self.notifier = notifier  # lets the model notify, and the agent say when long work is done
+        self.long_turn_seconds = long_turn_seconds  # a turn this long notifies its person when done (0: never)
         self.backend = backend
         self.toolbox = toolbox
         self.prompt = prompt
@@ -314,6 +344,7 @@ class Agent:
             raise ServerStopping("The server is stopping and takes no new question.")
         self.stats.active += 1
         self.stats.turns += 1
+        started = time.monotonic()
         try:
             # aclosing: if the client goes away, the turn is closed now (its lock and its
             # pending tool request released), not whenever the garbage collector gets to it
@@ -322,9 +353,51 @@ class Agent:
                     if event["type"] == "done":
                         self.stats.prompt_tokens += event["usage"]["prompt_tokens"]
                         self.stats.completion_tokens += event["usage"]["completion_tokens"]
+                        self._long_turn_done(request, event, time.monotonic() - started)
                     yield event
         finally:
             self.stats.active -= 1
+
+    # ------------------------------------------------------------------
+    # Notifications of the server's own long work
+    # ------------------------------------------------------------------
+    def _notify(self, person_id: int, text: str, title: str, targets: tuple[str, ...], conversation: str) -> None:
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.notify(person_id, text, title, targets, SERVER, conversation, limited=False)
+        except NotificationError as error:
+            log.warning("could not notify person %s: %s", person_id, error)
+
+    def _long_turn_done(self, request: ChatRequest, done: dict, seconds: float) -> None:
+        """A turn that took long is finished: its person may have gone to do something else, tell them."""
+        if not self.long_turn_seconds or seconds < self.long_turn_seconds or request.ephemeral or request.quiet:
+            return
+        reply = " ".join(done["reply"].split())
+        if len(reply) > NOTIFIED_REPLY:
+            reply = reply[: NOTIFIED_REPLY - 1] + "…"
+        minutes, rest = divmod(int(seconds), 60)
+        took = f"{minutes} min {rest:02d} s" if minutes else f"{rest} s"
+        text = f"Clara has finished answering in {done['conversation']} (it took {took})."
+        if reply:
+            text += f"\n{reply}"
+        self._notify(done["person"]["id"], text, "Answer ready", (), done["conversation"])
+
+    def _compaction_done(self, conversation: str, before: float, after: float) -> None:
+        """Tell the person a conversation of theirs was summarised (not a conversation of several people)."""
+        people = self.memory.people_in_conversation(conversation)
+        if len(people) != 1:
+            return
+        surface = conversation.partition(":")[0]
+        targets = (surface,) if SURFACE_RE.match(surface) else ()
+        self._notify(
+            people[0],
+            f"The conversation {conversation} was summarised: its context went from {before:.0f}% to "
+            f"{after:.0f}% of the model's window. The older messages are now replaced by a summary.",
+            "Conversation summarised",
+            targets,
+            conversation,
+        )
 
     async def _turn(self, request: ChatRequest, owner: str) -> AsyncIterator[dict]:
         self.validate(request)
@@ -338,7 +411,8 @@ class Agent:
         conversation = request.conversation_id
         ephemeral = request.ephemeral
         context = ToolContext(
-            person, self.memory, self.reminders, request.timezone, request.surface, request.user_id, conversation
+            person, self.memory, self.reminders, request.timezone, request.surface, request.user_id, conversation,
+            self.notifier,
         )
         client_tools = {schema["function"]["name"] for schema in request.tools}
         server_tools = [] if ephemeral or request.no_tools else list(self.toolbox.schemas)
@@ -584,6 +658,40 @@ class Agent:
         finally:
             self._compactions -= 1
 
+    async def title(self, conversation: str) -> str:
+        """Clara's title for a listed conversation nobody has titled yet, written from its first question and
+        answer (or its summary, when they were purged), and kept. The title it has if it has one."""
+        info = self.memory.conversation_info(conversation)
+        if info is None:
+            raise NothingToTitle("No such conversation")
+        if info.title:
+            return info.title
+        if not self.accepting:
+            raise ServerStopping("The server is stopping and takes no new request.")
+        shown, _ = self.memory.transcript(conversation, limit=1_000_000)
+        question = next((m.content for m in shown if m.role == "user"), "")
+        answer = next((m.content for m in shown if m.role == "assistant"), "")
+        if question:
+            excerpt = f"Question: {question[:TITLE_EXCERPT]}"
+            excerpt += f"\n\nAnswer: {answer[:TITLE_EXCERPT]}" if answer else ""
+        else:
+            excerpt = self.memory.state(conversation).summary[: 2 * TITLE_EXCERPT]
+        if not excerpt.strip():
+            raise NothingToTitle("The conversation has nothing to title yet")
+        messages = [{"role": "system", "content": TITLE_INSTRUCTIONS}, {"role": "user", "content": excerpt}]
+        self._compactions += 1  # keeps the server from stopping under it, like a compaction
+        try:
+            parts: list[str] = []
+            async with contextlib.aclosing(self._model(messages, None)) as model:
+                async for chunk in model:
+                    parts.append(chunk.text)
+        finally:
+            self._compactions -= 1
+        title = clean_title("".join(parts))
+        if not title:
+            raise RuntimeError("the model returned an empty title")
+        return self.memory.title_if_untitled(conversation, title)
+
     async def _summarise(self, transcript: str, previous: str, focus: str) -> str:
         parts: list[str] = []
         async with contextlib.aclosing(self._model(summary_request(transcript, previous, focus), None)) as model:
@@ -632,7 +740,9 @@ class Agent:
         if self.purge_summarised:
             self.memory.purge_summarised(conversation, old[-1].id)
         window = self.window
-        return 100 * state.context_tokens / window, 100 * after_tokens / window
+        before, after = 100 * state.context_tokens / window, 100 * after_tokens / window
+        self._compaction_done(conversation, before, after)
+        return before, after
 
 
 @dataclass

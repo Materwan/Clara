@@ -7,8 +7,14 @@
     messages(id, conversation, person, role, content)
                                             conversation history, one thread per conversation id
     reminders(id, person, text, due_at, ...)    what is still to be announced (see reminders.py)
-    reminder_events(id, person, text, ...)      what was announced; every client reads them in order
-    reminder_cursors(client, last_event_id)     how far each client has read
+    reminder_events(id, person, kind, text, ...)
+                                            what was announced: reminders that came due and notifications
+                                            (see notifications.py), each for one person (NULL: everybody)
+                                            and some of their surfaces ('': all of them)
+    reminder_cursors(client, last_event_id)     how far each listener (client + account) has read
+    conversations(conversation, person, title, pinned, ...)
+                                            the conversations a client can list: who started each, its
+                                            title, when it was last written in (from its first turn on)
 
 Facts follow the *person*, history follows the *conversation*: Clara knows you
 are the same human on every surface, but a Discord channel and a terminal
@@ -31,6 +37,8 @@ from pathlib import Path
 
 MAX_FACT_LENGTH = 300
 MAX_NAME_LENGTH = 80
+MAX_TITLE_LENGTH = 100
+PREVIEW_LENGTH = 300  # characters of a conversation's first message given with a list of them
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS people (
@@ -92,6 +100,17 @@ CREATE TABLE IF NOT EXISTS reminder_cursors (
     client        TEXT PRIMARY KEY,
     last_event_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation TEXT PRIMARY KEY,
+    person_id    INTEGER REFERENCES people (id),
+    surface      TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    titled_by    TEXT NOT NULL DEFAULT '',
+    pinned       INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_person ON conversations (person_id, surface, updated_at);
 """
 
 # Columns added after the first release: databases created before have to get them.
@@ -105,8 +124,16 @@ _ADDED_COLUMNS = {
         "surface": "TEXT NOT NULL DEFAULT ''",
         "user_id": "TEXT NOT NULL DEFAULT ''",
         "conversation": "TEXT NOT NULL DEFAULT ''",
+        "targets": "TEXT NOT NULL DEFAULT ''",  # surfaces it is shown on, "|"-separated ('': all of them)
     },
-    "reminder_events": {"message": "TEXT"},  # what Clara wrote for it (NULL: just the text)
+    "reminder_events": {
+        "message": "TEXT",  # what Clara wrote for it (NULL: just the text)
+        "kind": "TEXT NOT NULL DEFAULT 'reminder'",  # "reminder" or "notification"
+        "title": "TEXT NOT NULL DEFAULT ''",
+        "targets": "TEXT NOT NULL DEFAULT ''",
+        "source": "TEXT NOT NULL DEFAULT ''",  # who sent a notification: "clara", "server" or a client
+        "conversation": "TEXT NOT NULL DEFAULT ''",  # the conversation it is about, if any
+    },
 }
 
 
@@ -177,18 +204,51 @@ class Reminder:
     surface: str = ""  # where it was set, "" if unknown (reminders from before this was kept)
     user_id: str = ""
     conversation: str = ""
+    targets: tuple[str, ...] = ()  # surfaces it is shown on; empty: every surface of the person
 
 
 @dataclass(frozen=True)
 class ReminderEvent:
-    """A reminder that came due. Kept for a while so that a client offline at that moment gets it later."""
+    """Something announced to a person: a reminder that came due, or a notification. Kept for a while so
+    that a client offline at that moment gets it later."""
 
     id: int
     text: str
-    due_at: str  # ISO, UTC
+    due_at: str  # ISO, UTC (a notification: when it was sent)
     fired_at: str  # ISO, UTC
-    author: str | None  # name of the person who set it
+    author: str | None  # name of the person it is for (who set the reminder)
     message: str | None = None  # what Clara wrote to announce it; None: only `text` is shown
+    kind: str = "reminder"  # or "notification"
+    title: str = ""
+    targets: tuple[str, ...] = ()  # surfaces it is for; empty: all of them
+    source: str = ""  # who sent a notification
+    person_id: int | None = None  # None: for everybody
+    conversation: str = ""
+
+
+@dataclass(frozen=True)
+class ConversationInfo:
+    """A conversation as a list of them shows it."""
+
+    conversation: str
+    person_id: int | None  # who started it
+    surface: str
+    title: str  # "" until Clara or the person gives it one
+    titled_by: str  # "", "clara" or "person"
+    pinned: bool
+    created_at: str  # ISO, UTC
+    updated_at: str  # ISO, UTC: its last turn
+    preview: str = ""  # the start of its first message still stored
+
+
+@dataclass(frozen=True)
+class ShownMessage:
+    """A message as a person reads it back: a question or an answer (tool calls and results are left out)."""
+
+    id: int
+    role: str  # "user" or "assistant"
+    content: str
+    created_at: str  # ISO, UTC
 
 
 @dataclass(frozen=True)
@@ -200,6 +260,19 @@ class ConversationState:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def join_targets(targets: tuple[str, ...] | list[str]) -> str:
+    return "|".join(sorted(set(targets)))
+
+
+def split_targets(stored: str) -> tuple[str, ...]:
+    return tuple(part for part in (stored or "").split("|") if part)
+
+
+def _like(text: str) -> str:
+    """A LIKE pattern matching `text` anywhere, its own % and _ taken literally (with ESCAPE '\\')."""
+    return "%" + re.sub(r"([\\%_])", r"\\\1", text) + "%"
 
 
 def _one_line(text: str) -> str:
@@ -398,6 +471,9 @@ class Memory:
             for conversation in alone:
                 self._db.execute("DELETE FROM messages WHERE conversation = ?", (conversation,))
                 self._db.execute("DELETE FROM conversation_state WHERE conversation = ?", (conversation,))
+                self._db.execute("DELETE FROM conversations WHERE conversation = ?", (conversation,))
+            # the shared conversations they started stay, with nobody as their owner
+            self._db.execute("UPDATE conversations SET person_id = NULL WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM messages WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM reminders WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM reminder_events WHERE person_id = ?", (person_id,))
@@ -421,6 +497,7 @@ class Memory:
         db.execute("UPDATE messages SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("UPDATE reminders SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("UPDATE reminder_events SET person_id = ? WHERE person_id = ?", (target, source))
+        db.execute("UPDATE conversations SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("DELETE FROM people WHERE id = ?", (source,))
 
     # ------------------------------------------------------------------
@@ -498,6 +575,7 @@ class Memory:
             row["surface"],
             row["user_id"],
             row["conversation"],
+            split_targets(row["targets"]),
         )
 
     def add_reminder(
@@ -508,14 +586,18 @@ class Memory:
         repeat: str = "",
         zone: str = "",
         origin: tuple[str, str, str] = ("", "", ""),
+        targets: tuple[str, ...] = (),
     ) -> Reminder:
         """`origin` is (surface, user_id, conversation) of where it was set: the answer that announces
-        the reminder is written in that conversation."""
+        the reminder is written in that conversation. `targets`: the surfaces it is shown on (empty: all)."""
         with self._lock, self._db:
             cursor = self._db.execute(
                 "INSERT INTO reminders (person_id, text, due_at, anchor_at, repeat, timezone, created_at,"
-                " surface, user_id, conversation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (person_id, text, self._stamp(due_at), self._stamp(due_at), repeat, zone, _now(), *origin),
+                " surface, user_id, conversation, targets) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    person_id, text, self._stamp(due_at), self._stamp(due_at), repeat, zone, _now(), *origin,
+                    join_targets(targets),
+                ),
             )
             row = self._db.execute("SELECT * FROM reminders WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return self._reminder(row)
@@ -565,8 +647,12 @@ class Memory:
         it (`next_due`) or, if it was a one-off, remove it."""
         with self._lock, self._db:
             cursor = self._db.execute(
-                "INSERT INTO reminder_events (person_id, text, due_at, fired_at, message) VALUES (?, ?, ?, ?, ?)",
-                (reminder.person_id, reminder.text, self._stamp(reminder.due_at), self._stamp(now), message),
+                "INSERT INTO reminder_events (person_id, text, due_at, fired_at, message, kind, targets,"
+                " conversation) VALUES (?, ?, ?, ?, ?, 'reminder', ?, ?)",
+                (
+                    reminder.person_id, reminder.text, self._stamp(reminder.due_at), self._stamp(now), message,
+                    join_targets(reminder.targets), reminder.conversation,
+                ),
             )
             if next_due is None:
                 self._db.execute("DELETE FROM reminders WHERE id = ?", (reminder.id,))
@@ -584,16 +670,83 @@ class Memory:
             self._stamp(now),
             author["name"] if author else None,
             message,
+            "reminder",
+            "",
+            reminder.targets,
+            "",
+            reminder.person_id,
+            reminder.conversation,
         )
 
-    def reminder_events_after(self, event_id: int, limit: int = 100) -> list[ReminderEvent]:
+    def add_notification(
+        self,
+        person_id: int | None,
+        text: str,
+        now: datetime,
+        title: str = "",
+        targets: tuple[str, ...] = (),
+        source: str = "",
+        conversation: str = "",
+    ) -> ReminderEvent:
+        """Store a notification for one person (None: for everybody), to be streamed to their clients."""
+        stamp = self._stamp(now)
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "INSERT INTO reminder_events (person_id, text, due_at, fired_at, kind, title, targets, source,"
+                " conversation) VALUES (?, ?, ?, ?, 'notification', ?, ?, ?, ?)",
+                (person_id, text, stamp, stamp, title, join_targets(targets), source, conversation),
+            )
+            row = self._db.execute(self._EVENT_COLUMNS + " WHERE e.id = ?", (cursor.lastrowid,)).fetchone()
+        return self._event(row)
+
+    _EVENT_COLUMNS = (
+        "SELECT e.id, e.text, e.due_at, e.fired_at, p.name, e.message, e.kind, e.title, e.targets, e.source,"
+        " e.person_id, e.conversation FROM reminder_events e LEFT JOIN people p ON p.id = e.person_id"
+    )
+
+    @staticmethod
+    def _event(row: sqlite3.Row) -> ReminderEvent:
+        return ReminderEvent(
+            row["id"],
+            row["text"],
+            row["due_at"],
+            row["fired_at"],
+            row["name"],
+            row["message"],
+            row["kind"],
+            row["title"],
+            split_targets(row["targets"]),
+            row["source"],
+            row["person_id"],
+            row["conversation"],
+        )
+
+    EVERYONE = object()  # reminder_events_after(): no filter on the person
+
+    def reminder_events_after(
+        self, event_id: int, limit: int = 100, person_id: int | None | object = EVERYONE
+    ) -> list[ReminderEvent]:
+        """The events after `event_id`, oldest first. With `person_id`: only that person's, and the ones for
+        everybody (`None`: only the ones for everybody)."""
+        where, values = "e.id > ?", [event_id]
+        if person_id is not self.EVERYONE:
+            where += " AND (e.person_id IS NULL OR e.person_id = ?)"
+            values.append(person_id)
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.id, e.text, e.due_at, e.fired_at, p.name, e.message FROM reminder_events e"
-                " LEFT JOIN people p ON p.id = e.person_id WHERE e.id > ? ORDER BY e.id LIMIT ?",
-                (event_id, limit),
+                self._EVENT_COLUMNS + f" WHERE {where} ORDER BY e.id LIMIT ?", (*values, limit)
             ).fetchall()
-        return [ReminderEvent(*row) for row in rows]
+        return [self._event(row) for row in rows]
+
+    def people_in_conversation(self, conversation: str) -> list[int]:
+        """Who wrote in a conversation (person ids)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT person_id FROM messages WHERE conversation = ? AND role = 'user'"
+                " AND person_id IS NOT NULL ORDER BY person_id",
+                (conversation,),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def last_reminder_event(self) -> int:
         with self._lock:
@@ -694,6 +847,11 @@ class Memory:
         now = _now()
         with self._lock, self._db:
             self._db.execute(
+                "INSERT INTO conversations (conversation, person_id, surface, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (conversation) DO UPDATE SET updated_at = excluded.updated_at",
+                (conversation, person_id, conversation.partition(":")[0], now, now),
+            )
+            self._db.execute(
                 "INSERT INTO messages (conversation, person_id, role, content, created_at, prefix)"
                 " VALUES (?, ?, 'user', ?, ?, ?)",
                 (conversation, person_id, question, now, prefix),
@@ -721,9 +879,100 @@ class Memory:
     def clear_conversation(self, conversation: str) -> int:
         with self._lock, self._db:
             self._db.execute("DELETE FROM conversation_state WHERE conversation = ?", (conversation,))
+            self._db.execute("DELETE FROM conversations WHERE conversation = ?", (conversation,))
             return self._db.execute(
                 "DELETE FROM messages WHERE conversation = ?", (conversation,)
             ).rowcount
+
+    # ------------------------------------------------------------------
+    # The list of conversations
+    # ------------------------------------------------------------------
+    _CONVERSATION_COLUMNS = (
+        "SELECT c.conversation, c.person_id, c.surface, c.title, c.titled_by, c.pinned, c.created_at,"
+        " c.updated_at, (SELECT substr(m.content, 1, ?) FROM messages m WHERE m.conversation = c.conversation"
+        " AND m.role = 'user' ORDER BY m.id LIMIT 1) AS preview FROM conversations c"
+    )
+
+    @staticmethod
+    def _conversation(row: sqlite3.Row) -> ConversationInfo:
+        return ConversationInfo(
+            row["conversation"], row["person_id"], row["surface"], row["title"], row["titled_by"],
+            bool(row["pinned"]), row["created_at"], row["updated_at"], row["preview"] or "",
+        )
+
+    def conversation_info(self, conversation: str) -> ConversationInfo | None:
+        with self._lock:
+            row = self._db.execute(
+                self._CONVERSATION_COLUMNS + " WHERE c.conversation = ?", (PREVIEW_LENGTH, conversation)
+            ).fetchone()
+        return self._conversation(row) if row else None
+
+    def conversations_of(
+        self, person_id: int, surface: str, query: str = "", limit: int = 200
+    ) -> list[ConversationInfo]:
+        """The conversations a person started on a surface: pinned ones first, then the last written in.
+        `query` keeps those whose title, messages or summary contain it (case is ignored for ASCII letters)."""
+        sql = self._CONVERSATION_COLUMNS + " WHERE c.person_id = ? AND c.surface = ?"
+        params: list = [PREVIEW_LENGTH, person_id, surface]
+        if query.strip():
+            pattern = _like(query.strip())
+            sql += (
+                " AND (c.title LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM messages m"
+                " WHERE m.conversation = c.conversation AND m.role IN ('user', 'assistant')"
+                " AND m.content LIKE ? ESCAPE '\\') OR EXISTS (SELECT 1 FROM conversation_state s"
+                " WHERE s.conversation = c.conversation AND s.summary LIKE ? ESCAPE '\\'))"
+            )
+            params += [pattern, pattern, pattern]
+        sql += " ORDER BY c.pinned DESC, c.updated_at DESC, c.rowid DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._db.execute(sql, params).fetchall()
+        return [self._conversation(row) for row in rows]
+
+    def update_conversation(self, conversation: str, title: str | None = None, pinned: bool | None = None) -> bool:
+        """The person renames (an empty title: back to none) and/or pins a conversation. False if it is
+        not listed."""
+        with self._lock, self._db:
+            if self._db.execute(
+                "SELECT 1 FROM conversations WHERE conversation = ?", (conversation,)
+            ).fetchone() is None:
+                return False
+            if title is not None:
+                title = _one_line(title)[:MAX_TITLE_LENGTH]
+                self._db.execute(
+                    "UPDATE conversations SET title = ?, titled_by = ? WHERE conversation = ?",
+                    (title, "person" if title else "", conversation),
+                )
+            if pinned is not None:
+                self._db.execute(
+                    "UPDATE conversations SET pinned = ? WHERE conversation = ?", (int(pinned), conversation)
+                )
+            return True
+
+    def title_if_untitled(self, conversation: str, title: str) -> str:
+        """Give Clara's title to a conversation nobody has titled yet (the person may have, meanwhile).
+        Returns the title it has now."""
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE conversations SET title = ?, titled_by = 'clara' WHERE conversation = ? AND title = ''",
+                (_one_line(title)[:MAX_TITLE_LENGTH], conversation),
+            )
+            row = self._db.execute(
+                "SELECT title FROM conversations WHERE conversation = ?", (conversation,)
+            ).fetchone()
+        return row["title"] if row else ""
+
+    def transcript(self, conversation: str, limit: int = 200) -> tuple[list[ShownMessage], bool]:
+        """The last `limit` questions and answers of a conversation still stored, oldest first, and
+        whether older ones were left out."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, role, content, created_at FROM messages WHERE conversation = ?"
+                " AND role IN ('user', 'assistant') AND content != '' ORDER BY id DESC LIMIT ?",
+                (conversation, limit + 1),
+            ).fetchall()
+        shown = [ShownMessage(row["id"], row["role"], row["content"], row["created_at"]) for row in rows[:limit]]
+        return shown[::-1], len(rows) > limit
 
     # ------------------------------------------------------------------
     # Summary and size of a conversation

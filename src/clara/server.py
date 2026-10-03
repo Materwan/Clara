@@ -9,10 +9,16 @@
     POST   /v1/accounts/link-code       a code proving control of an account
     POST   /v1/accounts/link            "this account is the same person as that one" (needs the code)
     POST   /v1/turns/{id}/tool-results  a client's answer to a `tool_requests` event
-    POST   /v1/reminders                set a reminder: a text and a moment, announced to every client
+    POST   /v1/reminders                set a reminder: a text and a moment, announced to the person who set it
     GET    /v1/reminders                the reminders a person set that have not fired
     DELETE /v1/reminders/{id}           cancel one
-    GET    /v1/reminders/stream         Server-Sent Events: `reminder` when one comes due (all clients)
+    POST   /v1/notifications            send a notification to a person, now
+    GET    /v1/notifications/stream     Server-Sent Events of an account: `reminder`, `notification`, `server`
+                                        (also served as /v1/reminders/stream)
+    GET    /v1/conversations            the conversations an account's person started on its surface
+    GET    /v1/conversations/{id}/messages  its questions and answers, to show it again
+    PATCH  /v1/conversations/{id}       rename, pin
+    POST   /v1/conversations/{id}/title Clara writes its title (if nobody has)
     GET    /v1/conversations/{id}       size of the context, summary
     POST   /v1/conversations/{id}/compact   summarise the older messages
     DELETE /v1/conversations/{id}       forget the thread (facts are kept)
@@ -40,7 +46,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any, AsyncIterator
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -50,6 +56,7 @@ from .agent import (
     ClientToolTimeout,
     ModelTimeout,
     NothingToCompact,
+    NothingToTitle,
     PromptTooLarge,
     ServerStopping,
 )
@@ -57,12 +64,14 @@ from .announce import compose
 from .commands import CommandContext, CommandResult, registry
 from .lifecycle import Lifecycle
 from .linking import LinkCodes
-from .memory import Memory, MergeRefused, Person
+from .memory import MAX_TITLE_LENGTH, ConversationInfo, Memory, MergeRefused, Person
+from .notifications import MAX_TARGETS, MAX_TEXT, MAX_TITLE, SURFACE_RE, NotificationError, Notifier
 from .prompt import SystemPrompt
 from .providers import ProviderManager
 from .reminders import ReminderError, ReminderService, describe
 from .settings import Settings, SettingsError
 from .tools import default_toolbox
+from .traffic import TrafficLog, TrafficMiddleware
 
 log = logging.getLogger("clara")
 
@@ -140,6 +149,39 @@ class ReminderBody(_Body):
     repeat: str = Field(default="", max_length=16)  # "", "daily", "weekly" or "monthly"
     timezone: str | None = Field(default=None, max_length=64)  # IANA name; read a time without offset in it
     conversation: str | None = Field(default=None, min_length=1, max_length=200)  # where Clara announces it
+    targets: list[Surface] = Field(default_factory=list, max_length=MAX_TARGETS)  # surfaces shown on; []: all
+
+
+class NotificationBody(_Body):
+    surface: Surface  # the account of the person to notify
+    user_id: ExternalId
+    user_name: str | None = Field(default=None, max_length=80)
+    text: str = Field(min_length=1, max_length=MAX_TEXT)
+    title: str = Field(default="", max_length=MAX_TITLE)
+    targets: list[Surface] = Field(default_factory=list, max_length=MAX_TARGETS)  # surfaces shown on; []: all
+    conversation: str | None = Field(default=None, min_length=1, max_length=200)  # what it is about, if any
+
+
+class AccountBody(_Body):
+    surface: Surface
+    user_id: ExternalId
+
+
+class ConversationBody(AccountBody):
+    title: str | None = Field(default=None, max_length=MAX_TITLE_LENGTH)  # "": no title
+    pinned: bool | None = None
+
+
+def describe_conversation(info: ConversationInfo) -> dict:
+    return {
+        "id": info.conversation,
+        "title": info.title,
+        "titled_by": info.titled_by,
+        "pinned": info.pinned,
+        "created_at": info.created_at,
+        "updated_at": info.updated_at,
+        "preview": info.preview,
+    }
 
 
 class CommandBody(BaseModel):
@@ -197,6 +239,19 @@ Client = Annotated[str, Depends(authenticate)]
 Admin = Annotated[str, Depends(authenticate_admin)]
 
 
+def peer_of(settings: Settings, authorization: str) -> str:
+    """Who is calling, for the traffic log: never the token itself."""
+    scheme, _, given = authorization.partition(" ")
+    given = given.strip()
+    if scheme.lower() != "bearer" or not given:
+        return "anonymous"
+    for tokens, kind in ((settings.tokens, "client"), (settings.admin_tokens, "admin")):
+        for token, name in tokens.items():
+            if secrets.compare_digest(token.encode(), given.encode()):
+                return f"{kind}:{name}"
+    return "unknown-token"
+
+
 def sse(event: dict) -> str:
     return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -237,7 +292,14 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             "client %r may speak for any surface: set CLARA_CLIENT_SURFACES to limit it", name
         )
     providers = providers or ProviderManager.from_settings(settings)
-    reminders = ReminderService(memory)
+    traffic = (
+        TrafficLog(settings.logs_dir, settings.traffic_log_days, settings.traffic_log_max_body)
+        if settings.traffic_log
+        else None
+    )
+    providers.traffic = traffic
+    notifier = Notifier(memory)
+    reminders = ReminderService(memory, notifier=notifier)
     agent = Agent(
         memory,
         providers,
@@ -255,6 +317,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         first_token_timeout=settings.llm_first_token_timeout,
         idle_timeout=settings.llm_idle_timeout,
         reminders=reminders,
+        notifier=notifier,
+        long_turn_seconds=settings.notify_long_turn,
     )
 
     if settings.reminder_ai_timeout:
@@ -273,16 +337,24 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             with contextlib.suppress(asyncio.CancelledError):
                 await scheduler
             memory.close()
+            if traffic is not None:
+                traffic.close()
 
     app = FastAPI(title="Clara", lifespan=lifespan)
+    app.add_middleware(
+        TrafficMiddleware, traffic=lambda: traffic, identify=lambda header: peer_of(settings, header)
+    )
     app.state.settings = settings
     app.state.memory = memory
     app.state.agent = agent
     app.state.reminders = reminders
+    app.state.notifier = notifier
+    app.state.traffic = traffic
     app.state.lifecycle = lifecycle
     app.state.providers = providers
     app.state.commands = CommandContext(
-        settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}", lifecycle
+        settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}", lifecycle,
+        notifier,
     )
 
     def known_person(surface: Surface, user_id: ExternalId) -> Person:
@@ -360,29 +432,69 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         person = memory.resolve(body.surface, body.user_id, body.user_name)
         origin = (body.surface, body.user_id, body.conversation or f"{body.surface}:{body.user_id}")
         try:
-            reminder = reminders.create(person, body.text, body.at, body.repeat, body.timezone, origin)
+            reminder = reminders.create(
+                person, body.text, body.at, body.repeat, body.timezone, origin, body.targets
+            )
         except ReminderError as error:
             raise HTTPException(422, str(error)) from None
         return describe(reminder)
 
-    @app.get("/v1/reminders/stream")
-    async def reminder_stream(client: Client) -> StreamingResponse:
-        """Every client gets every reminder: the surface restrictions do not apply here."""
+    @app.post("/v1/notifications", status_code=201)
+    async def send_notification(body: NotificationBody, client: Client, http: Request) -> dict:
+        """A notification for the person behind an account, on some of their surfaces (any, not only the
+        client's own: it is the same person)."""
+        require_surface(http, client, body.surface)
+        if body.conversation:
+            require_conversation(http, client, body.conversation)
+        person = memory.resolve(body.surface, body.user_id, body.user_name)
+        try:
+            event = notifier.notify(
+                person.id, body.text, body.title, body.targets, client, body.conversation or ""
+            )
+        except NotificationError as error:
+            status = 429 if "Too many" in str(error) else 422
+            raise HTTPException(status, str(error)) from None
+        return {"id": event.id, "sent_at": event.fired_at, "targets": list(event.targets)}
+
+    async def event_stream(client: Client, http: Request, surface: str | None, user_id: str | None):
+        """What the server announces to an account: its person's reminders and notifications (for its
+        surface), and the state of the server. Without an account: only the state of the server and what
+        is for everybody."""
+        if bool(surface) != bool(user_id):
+            raise HTTPException(422, "Give both surface and user_id, or neither")
+        if surface is not None:
+            if not SURFACE_RE.match(surface) or not 1 <= len(user_id or "") <= 128:
+                raise HTTPException(422, "Bad surface or user_id")
+            require_surface(http, client, surface)
 
         async def events() -> AsyncIterator[str]:
             try:
-                async with contextlib.aclosing(with_keepalive(reminders.events(client))) as stream:
-                    async for event in stream:
+                stream = notifier.events(client, surface, user_id)
+                async with contextlib.aclosing(with_keepalive(stream)) as keepalive:
+                    async for event in keepalive:
                         yield ": keepalive\n\n" if event is None else sse(event)
             except Exception:
-                log.exception("reminder stream failed (client=%s)", client)
-                yield sse({"type": "error", "message": "The reminder stream failed"})
+                log.exception("event stream failed (client=%s)", client)
+                yield sse({"type": "error", "message": "The event stream failed"})
 
         return StreamingResponse(
             events(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/v1/notifications/stream")
+    async def notification_stream(
+        client: Client, http: Request, surface: str | None = None, user_id: str | None = None
+    ) -> StreamingResponse:
+        return await event_stream(client, http, surface, user_id)
+
+    @app.get("/v1/reminders/stream")
+    async def reminder_stream(
+        client: Client, http: Request, surface: str | None = None, user_id: str | None = None
+    ) -> StreamingResponse:
+        """The same stream as /v1/notifications/stream (its earlier name)."""
+        return await event_stream(client, http, surface, user_id)
 
     @app.get("/v1/reminders")
     async def list_reminders(client: Client, http: Request, surface: Surface, user_id: ExternalId) -> dict:
@@ -465,6 +577,82 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
             raise HTTPException(422, str(error)) from None
         return {"accepted": len(results)}
 
+    def own_conversation(
+        client: str, http: Request, surface: str, user_id: str, conversation: str
+    ) -> ConversationInfo:
+        """The listed conversation, if the account's person started it; else 404."""
+        require_surface(http, client, surface)
+        require_conversation(http, client, conversation)
+        person = memory.find_person(surface, user_id)
+        info = memory.conversation_info(conversation)
+        if person is None or info is None or info.person_id != person.id:
+            raise HTTPException(404, "No such conversation of yours")
+        return info
+
+    @app.get("/v1/conversations")
+    async def list_conversations(
+        client: Client,
+        http: Request,
+        surface: Surface,
+        user_id: ExternalId,
+        q: Annotated[str, Query(max_length=200)] = "",
+        limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    ) -> dict:
+        """The conversations the account's person started on this surface, pinned first, then the last
+        written in; `q` keeps those whose title, messages or summary contain it."""
+        require_surface(http, client, surface)
+        person = memory.find_person(surface, user_id)
+        found = memory.conversations_of(person.id, surface, q, limit) if person else []
+        return {"conversations": [describe_conversation(info) for info in found]}
+
+    # Before GET /v1/conversations/{conversation:path}, which would take ".../messages" for an id
+    @app.get("/v1/conversations/{conversation:path}/messages")
+    async def conversation_messages(
+        conversation: str,
+        client: Client,
+        http: Request,
+        surface: Surface,
+        user_id: ExternalId,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    ) -> dict:
+        info = own_conversation(client, http, surface, user_id, conversation)
+        shown, more = memory.transcript(conversation, limit)
+        state = memory.state(conversation)
+        first_kept = shown[0].id if shown else 0
+        return {
+            **describe_conversation(info),
+            # the summary, when it stands for messages not given (deleted by CLARA_PURGE_SUMMARISED, or too old)
+            "summary": state.summary if state.summary and (not shown or state.upto_id < first_kept) else "",
+            "earlier": more,  # older messages exist that are not given
+            "messages": [
+                {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at} for m in shown
+            ],
+        }
+
+    @app.patch("/v1/conversations/{conversation:path}")
+    async def update_conversation(
+        conversation: str, body: ConversationBody, client: Client, http: Request
+    ) -> dict:
+        own_conversation(client, http, body.surface, body.user_id, conversation)
+        memory.update_conversation(conversation, body.title, body.pinned)
+        return describe_conversation(memory.conversation_info(conversation))
+
+    @app.post("/v1/conversations/{conversation:path}/title")
+    async def title_conversation(conversation: str, body: AccountBody, client: Client, http: Request) -> dict:
+        own_conversation(client, http, body.surface, body.user_id, conversation)
+        try:
+            title = await agent.title(conversation)
+        except NothingToTitle as error:
+            raise HTTPException(409, str(error)) from None
+        except ServerStopping as error:
+            raise HTTPException(503, str(error)) from None
+        except ModelTimeout as error:
+            raise HTTPException(504, str(error)) from None
+        except Exception:
+            log.exception("titling failed (client=%s)", client)
+            raise HTTPException(502, "The language model failed") from None
+        return {"id": conversation, "title": title}
+
     @app.get("/v1/conversations/{conversation:path}")
     async def conversation_info(conversation: str, client: Client, http: Request) -> dict:
         require_conversation(http, client, conversation)
@@ -494,8 +682,19 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         }
 
     @app.delete("/v1/conversations/{conversation:path}")
-    async def clear_conversation(conversation: str, client: Client, http: Request) -> dict:
+    async def clear_conversation(
+        conversation: str,
+        client: Client,
+        http: Request,
+        surface: Surface | None = None,
+        user_id: ExternalId | None = None,
+    ) -> dict:
+        """Forget a conversation. With an account: only one its person started (404 otherwise)."""
         require_conversation(http, client, conversation)
+        if surface is not None or user_id is not None:
+            if surface is None or user_id is None:
+                raise HTTPException(422, "Give both surface and user_id, or neither")
+            own_conversation(client, http, surface, user_id, conversation)
         return {"deleted_messages": memory.clear_conversation(conversation)}
 
     @app.get("/v1/admin/commands")

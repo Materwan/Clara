@@ -16,6 +16,7 @@ from typing import Awaitable, Callable
 from .agent import Agent
 from .lifecycle import Lifecycle
 from .memory import Memory, Person
+from .notifications import Notifier
 from .providers import ProviderError, ProviderManager
 from .settings import Settings
 
@@ -43,6 +44,11 @@ class CommandContext:
     started_at: float
     listen: str  # "127.0.0.1:8765"
     lifecycle: Lifecycle | None = None
+    notifier: Notifier | None = None  # tells everybody when the provider or the model changes
+
+    def tell_everybody(self, text: str) -> None:
+        if self.notifier is not None:
+            self.notifier.broadcast(text, "Clara changed model")
 
 
 Handler = Callable[[CommandContext, str], "Awaitable[CommandResult | str]"]
@@ -213,6 +219,7 @@ async def provider_command(ctx: CommandContext, args: str) -> str:
             config = providers.switch(args)
         except ProviderError as error:
             raise CommandError(str(error)) from None
+        ctx.tell_everybody(f"Clara now runs on {config.label} ({config.id}), with the model {providers.model}.")
         problem = await providers.check()
         lines = [f"Now using {config.id} ({config.label}), model {providers.model}."]
         lines.append("Reachable." if problem is None else f"! Not reachable: {problem} (still selected)")
@@ -260,7 +267,8 @@ async def model_command(ctx: CommandContext, args: str) -> str:
         providers.set_model(args)
     except ProviderError as error:
         raise CommandError(str(error)) from None
-    note = "" if available is not None else f"\n! Not checked, provider unreachable: {unreachable}"
+    ctx.tell_everybody(f"Clara now uses the model {args} ({providers.config.label}).")
+    note ="" if available is not None else f"\n! Not checked, provider unreachable: {unreachable}"
     return f"{providers.config.id} now uses {args}.{note}"
 
 

@@ -80,9 +80,11 @@ DEFAULT_CLOUD_HOST = "https://ollama.com"
 PROVIDER_IDS = ("local", "cloud")
 
 
-def _flag(env: Mapping[str, str], key: str) -> bool:
+def _flag(env: Mapping[str, str], key: str, default: bool = False) -> bool:
     raw = env.get(key, "").strip().lower()
-    if raw in ("", "0", "false", "no", "off"):
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
         return True
@@ -132,6 +134,15 @@ class Settings:
     cloud_model: str
     cloud_context_window: int
     ollama_api_key: str | None = field(repr=False)
+    notify_long_turn: int = 120  # a turn this long (seconds) notifies its person when done (0: never)
+    # The traffic log (traffic.py): every request in and out, in data/logs
+    traffic_log: bool = True
+    traffic_log_days: int = 30  # files older than this are deleted
+    traffic_log_max_body: int = 100_000  # characters kept of each body
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.data_dir / "logs"
 
     @property
     def unrestricted_clients(self) -> list[str]:
@@ -211,4 +222,8 @@ class Settings:
             cloud_model=text("CLARA_CLOUD_MODEL", "gpt-oss:120b"),
             cloud_context_window=_positive_int(env, "CLARA_CLOUD_CONTEXT_WINDOW", 131_072),
             ollama_api_key=api_key,
+            notify_long_turn=_non_negative_int(env, "CLARA_NOTIFY_LONG_TURN", 120),
+            traffic_log=_flag(env, "CLARA_TRAFFIC_LOG", default=True),
+            traffic_log_days=_positive_int(env, "CLARA_TRAFFIC_LOG_DAYS", 30),
+            traffic_log_max_body=_positive_int(env, "CLARA_TRAFFIC_LOG_MAX_BODY", 100_000),
         )
