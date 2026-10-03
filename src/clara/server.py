@@ -675,9 +675,13 @@ def create_app(
     return app
 
 
-def configure_logging() -> None:
+def configure_logging(handler: logging.Handler | None = None) -> None:
+    """Log to stderr, or to `handler` (the file of headless mode)."""
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[handler or logging.StreamHandler()],
+        force=True,
     )
 
 
@@ -717,11 +721,13 @@ def uvicorn_config(app: FastAPI, settings: Settings, **options: Any) -> uvicorn.
     return uvicorn.Config(app, **options)
 
 
-async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
-    """Run the HTTP server, plus the interactive console on the same event loop."""
+async def serve(app: FastAPI, settings: Settings, with_console: bool, headless: bool = False) -> None:
+    """Run the HTTP server, plus the interactive console on the same event loop. `headless`: the log
+    handlers are the ones of `configure_logging` (uvicorn would write to stderr, which is gone)."""
     lifecycle: Lifecycle = app.state.lifecycle
     if not with_console:
-        await ClaraServer(uvicorn_config(app, settings), lifecycle).serve()
+        options = {"log_config": None} if headless else {}
+        await ClaraServer(uvicorn_config(app, settings, **options), lifecycle).serve()
         return
 
     from prompt_toolkit.patch_stdout import patch_stdout
@@ -760,24 +766,57 @@ async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
         await asyncio.gather(server_task, console_task, return_exceptions=True)
 
 
-def main(argv: list[str] | None = None) -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="clara-server", description="Run the Clara server.")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--headless",
         "--no-console",
+        dest="headless",
         action="store_true",
-        help="no interactive prompt (this is the default when not in a terminal)",
+        help="no interactive prompt, and survive the end of the terminal (an SSH session that closes): "
+        "SIGHUP is ignored and the log goes to <data dir>/logs/clara-server.log",
     )
-    args = parser.parse_args(argv)
+    mode.add_argument(
+        "--test",
+        action="store_true",
+        help="check the installation (configuration, data, port, model provider, Tailscale...) and show the "
+        "state of every check, then start normally (asking first if one failed)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     try:
         settings = Settings.from_env()
     except SettingsError as error:
         raise SystemExit(str(error)) from None
-    configure_logging()
-    with_console = not args.no_console and sys.stdin.isatty() and sys.stdout.isatty()
+    if args.test:
+        from .selftest import run_self_test
+
+        if not run_self_test(settings):
+            raise SystemExit(1)
+    if args.headless:
+        from .headless import detach_from_terminal, file_handler, log_path
+
+        path = log_path(settings)
+        configure_logging(file_handler(path))
+        logging.captureWarnings(True)
+        print(f"Headless: no console, SIGHUP ignored, the log is {path}", flush=True)
+        detach_from_terminal()
+    else:
+        configure_logging()
+    with_console = not args.headless and sys.stdin.isatty() and sys.stdout.isatty()
     try:
-        asyncio.run(serve(create_app(settings), settings, with_console))
+        asyncio.run(serve(create_app(settings), settings, with_console, args.headless))
     except KeyboardInterrupt:
         pass
+    except Exception:
+        if not args.headless:
+            raise
+        log.exception("clara-server crashed")  # nobody is watching a terminal: the log is the only trace
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

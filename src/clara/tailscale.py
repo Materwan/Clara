@@ -123,6 +123,16 @@ class Tailscale:
             "open to the whole internet, protected by the tokens only" if self.public else "your tailnet only",
         )
 
+    async def check(self) -> str | None:
+        """None if `start` would find tailscaled running (nothing is changed), else what is wrong."""
+        if not self.enabled:
+            return None
+        try:
+            await self._machine_name()
+        except _Problem as problem:
+            return str(problem)
+        return None
+
     async def stop(self) -> None:
         """Remove the mapping set by `start`."""
         if not self._touched:

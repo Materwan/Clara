@@ -38,8 +38,14 @@ Tests: `pytest`. Lint: `ruff check .` (both run in CI on Linux and Windows, Pyth
 ## The console
 
 Started in a terminal, `clara-server` shows a prompt beside the server logs
-(history, Tab completion). Without a terminal (systemd) or with
-`--no-console`, there is no prompt.
+(history, Tab completion). Without a terminal (systemd) there is no prompt.
+
+Two options change how it starts (they exclude each other):
+
+| Option | |
+| --- | --- |
+| `--headless` (alias `--no-console`) | No prompt, and **the server survives the end of its terminal**: closing an SSH session no longer kills it. It ignores SIGHUP, lets go of the terminal's input and output, and logs to `data/logs/clara-server.log` (5 files of 5 MB). Start it with `clara-server --headless &` (or `nohup`, tmux, systemd: it works the same), stop it with `kill <pid>` (SIGTERM stops it the careful way, see *Stopping the server*) or `clara-admin /stop`. Windows has no SIGHUP: there it only drops the console and logs to the file. |
+| `--test` | Before the prompt appears, checks the installation and shows the state of each check (`PASS`, `WARN`, `FAIL`, `SKIP`): configuration, data directory writable, database sound, system prompt, web site files, port free, model provider reachable and model installed, Tailscale. Nothing is changed. When nothing failed it goes on to start normally; when a check failed it asks `Start anyway? [y/N]` (and does not start when there is no terminal to ask on, exit code 1). |
 
 To use the same console **from another computer**, set `CLARA_ADMIN_TOKENS` on
 the server and run:
@@ -546,6 +552,8 @@ src/clara/
   compaction.py transcript and summary request for long conversations
   commands.py   the console commands (/provider, /status...), shared by both consoles
   console.py    the interactive prompt (history, completion)
+  headless.py   `--headless`: ignore SIGHUP, leave the terminal, log to a rotating file
+  selftest.py   `--test`: the checks run before the server starts
   server.py     FastAPI routes, auth, embedded console
   client.py     clara-chat (also shows reminders and notifications, and has /remind and /notify)
   admin.py      clara-admin (remote console)
