@@ -39,15 +39,13 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
-import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, AsyncIterator
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -62,6 +60,7 @@ from .agent import (
     ServerStopping,
 )
 from .announce import compose
+from .auth import Admin, Client, peer_of, require_account, require_conversation
 from .commands import CommandContext, CommandResult, registry
 from .lifecycle import Lifecycle
 from .linking import LinkCodes
@@ -75,6 +74,8 @@ from .settings import Settings, SettingsError
 from .tailscale import Tailscale
 from .tools import default_toolbox
 from .traffic import TrafficLog, TrafficMiddleware
+from .users import Users
+from .webapi import install, install_web
 
 log = logging.getLogger("clara")
 
@@ -191,88 +192,6 @@ class CommandBody(BaseModel):
     line: str = Field(min_length=1, max_length=2000)
 
 
-def _caller(request: Request, tokens: dict[str, str]) -> str | None:
-    """Name attached to the bearer token of the request, if it is one of `tokens`."""
-    scheme, _, given = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not given:
-        return None
-    caller = None
-    for token, name in tokens.items():  # no early exit: constant-ish time
-        if secrets.compare_digest(token.encode(), given.strip().encode()):
-            caller = name
-    return caller
-
-
-def _checked_caller(request: Request, tokens: dict[str, str]) -> str | None:
-    """`_caller`, except that an address sending too many wrong tokens is refused (429) for a while."""
-    limiter: FailureLimiter = request.app.state.auth_limiter
-    address = request.client.host if request.client else None
-    wait = limiter.blocked_for(address)
-    if wait:
-        raise HTTPException(
-            429, "Too many wrong tokens from this address: try again later.",
-            headers={"Retry-After": str(math.ceil(wait))},
-        )
-    caller = _caller(request, tokens)
-    if caller is not None:
-        limiter.succeeded(address)
-    elif limiter.failed(address):
-        log.warning("%s sent %d wrong tokens: refused for %d s", address, limiter.max_failures, limiter.block_seconds)
-    return caller
-
-
-def authenticate(request: Request) -> str:
-    """Name of the calling chat client, or 401 (429 after too many wrong tokens)."""
-    caller = _checked_caller(request, request.app.state.settings.tokens)
-    if caller is None:
-        raise HTTPException(401, "Missing or invalid token", headers={"WWW-Authenticate": "Bearer"})
-    return caller
-
-
-def authenticate_admin(request: Request) -> str:
-    """Name of the calling operator, or 403 (remote admin off) / 401."""
-    tokens = request.app.state.settings.admin_tokens
-    if not tokens:
-        raise HTTPException(403, "Remote admin is disabled: set CLARA_ADMIN_TOKENS")
-    caller = _checked_caller(request, tokens)
-    if caller is None:
-        raise HTTPException(
-            401, "Missing or invalid admin token", headers={"WWW-Authenticate": "Bearer"}
-        )
-    return caller
-
-
-def require_surface(request: Request, client: str, surface: str) -> None:
-    """403 unless the client may speak for `surface` (CLARA_CLIENT_SURFACES)."""
-    allowed = request.app.state.settings.client_surfaces.get(client)
-    if allowed is not None and surface not in allowed:
-        raise HTTPException(403, f"This client may not use the surface {surface!r}")
-
-
-def require_conversation(request: Request, client: str, conversation: str) -> None:
-    """403 unless the conversation belongs to a surface the client may use."""
-    allowed = request.app.state.settings.client_surfaces.get(client)
-    if allowed is not None and not any(conversation.startswith(f"{surface}:") for surface in allowed):
-        raise HTTPException(403, "This client may not use that conversation")
-
-
-Client = Annotated[str, Depends(authenticate)]
-Admin = Annotated[str, Depends(authenticate_admin)]
-
-
-def peer_of(settings: Settings, authorization: str) -> str:
-    """Who is calling, for the traffic log: never the token itself."""
-    scheme, _, given = authorization.partition(" ")
-    given = given.strip()
-    if scheme.lower() != "bearer" or not given:
-        return "anonymous"
-    for tokens, kind in ((settings.tokens, "client"), (settings.admin_tokens, "admin")):
-        for token, name in tokens.items():
-            if secrets.compare_digest(token.encode(), given.encode()):
-                return f"{kind}:{name}"
-    return "unknown-token"
-
-
 def sse(event: dict) -> str:
     return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -348,6 +267,8 @@ def create_app(
         ai_timeout = float(settings.reminder_ai_timeout)
         reminders.composer = lambda reminder: compose(agent, reminder, ai_timeout)
     lifecycle = Lifecycle(agent, reminders)
+    users = Users(memory, settings.session_days)
+    users.prune()
     tailscale = tailscale or Tailscale.from_settings(settings)
     if tailscale.enabled:
         if settings.host not in ("127.0.0.1", "localhost", "::1"):
@@ -379,10 +300,11 @@ def create_app(
 
     app = FastAPI(title="Clara", lifespan=lifespan)
     app.add_middleware(
-        TrafficMiddleware, traffic=lambda: traffic, identify=lambda header: peer_of(settings, header)
+        TrafficMiddleware, traffic=lambda: traffic, identify=lambda headers: peer_of(settings, app.state.users, headers)
     )
     app.state.settings = settings
     app.state.auth_limiter = FailureLimiter(settings.auth_max_failures, settings.auth_block_seconds)
+    app.state.users = users
     app.state.tailscale = tailscale
     app.state.memory = memory
     app.state.agent = agent
@@ -393,7 +315,7 @@ def create_app(
     app.state.providers = providers
     app.state.commands = CommandContext(
         settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}", lifecycle,
-        notifier, tailscale,
+        notifier, tailscale, users,
     )
 
     def known_person(surface: Surface, user_id: ExternalId) -> Person:
@@ -412,7 +334,7 @@ def create_app(
 
     def checked(http: Request, client: str, body: ChatBody) -> ChatRequest:
         refuse_when_stopping()
-        require_surface(http, client, body.surface)
+        require_account(http, client, body.surface, body.user_id)
         if body.conversation:
             require_conversation(http, client, body.conversation)
         request = body.to_request()
@@ -465,7 +387,7 @@ def create_app(
 
     @app.post("/v1/reminders", status_code=201)
     async def add_reminder(body: ReminderBody, client: Client, http: Request) -> dict:
-        require_surface(http, client, body.surface)
+        require_account(http, client, body.surface, body.user_id)
         if body.conversation:
             require_conversation(http, client, body.conversation)
         person = memory.resolve(body.surface, body.user_id, body.user_name)
@@ -482,7 +404,7 @@ def create_app(
     async def send_notification(body: NotificationBody, client: Client, http: Request) -> dict:
         """A notification for the person behind an account, on some of their surfaces (any, not only the
         client's own: it is the same person)."""
-        require_surface(http, client, body.surface)
+        require_account(http, client, body.surface, body.user_id)
         if body.conversation:
             require_conversation(http, client, body.conversation)
         person = memory.resolve(body.surface, body.user_id, body.user_name)
@@ -504,7 +426,7 @@ def create_app(
         if surface is not None:
             if not SURFACE_RE.match(surface) or not 1 <= len(user_id or "") <= 128:
                 raise HTTPException(422, "Bad surface or user_id")
-            require_surface(http, client, surface)
+            require_account(http, client, surface, user_id)
 
         async def events() -> AsyncIterator[str]:
             try:
@@ -537,7 +459,7 @@ def create_app(
 
     @app.get("/v1/reminders")
     async def list_reminders(client: Client, http: Request, surface: Surface, user_id: ExternalId) -> dict:
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         person = memory.find_person(surface, user_id)
         return {"reminders": [describe(r) for r in reminders.upcoming(person)] if person else []}
 
@@ -545,7 +467,7 @@ def create_app(
     async def cancel_reminder(
         reminder_id: int, client: Client, http: Request, surface: Surface, user_id: ExternalId
     ) -> dict:
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         person = known_person(surface, user_id)
         if not reminders.cancel(person, reminder_id):
             raise HTTPException(404, "No such reminder of yours")
@@ -555,7 +477,7 @@ def create_app(
     async def list_facts(
         client: Client, http: Request, surface: Surface, user_id: ExternalId
     ) -> dict:
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         person = known_person(surface, user_id)
         return {
             "person": {"id": person.id, "name": person.name},
@@ -564,7 +486,7 @@ def create_app(
 
     @app.post("/v1/memory/facts", status_code=201)
     async def add_fact(body: FactBody, client: Client, http: Request) -> dict:
-        require_surface(http, client, body.surface)
+        require_account(http, client, body.surface, body.user_id)
         person = memory.resolve(body.surface, body.user_id, body.user_name)
         try:
             fact = memory.add_fact(person.id, body.text)
@@ -576,7 +498,7 @@ def create_app(
     async def delete_fact(
         fact_id: int, client: Client, http: Request, surface: Surface, user_id: ExternalId
     ) -> dict:
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         person = known_person(surface, user_id)
         if not memory.delete_fact(person.id, fact_id):
             raise HTTPException(404, "No such fact for this person")
@@ -585,7 +507,7 @@ def create_app(
     @app.post("/v1/accounts/link-code")
     async def issue_link_code(body: LinkCodeBody, client: Client, http: Request) -> dict:
         """Step 1, from the client of the account to attach: a code valid for ten minutes."""
-        require_surface(http, client, body.surface)
+        require_account(http, client, body.surface, body.user_id)
         code = link_codes.issue(body.surface, body.user_id)
         return {"code": code, "expires_in": int(link_codes.lifetime)}
 
@@ -594,7 +516,7 @@ def create_app(
         """Step 2, from the client of the person to attach to: the code proves that whoever
         asks controls the account `surface:user_id`. Only the target's surface is checked here,
         since the two accounts usually belong to different clients."""
-        require_surface(http, client, body.to_surface)
+        require_account(http, client, body.to_surface, body.to_user_id)
         target = known_person(body.to_surface, body.to_user_id)
         if not link_codes.redeem(body.surface, body.user_id, body.code):
             raise HTTPException(403, "Wrong or expired link code")
@@ -620,7 +542,7 @@ def create_app(
         client: str, http: Request, surface: str, user_id: str, conversation: str
     ) -> ConversationInfo:
         """The listed conversation, if the account's person started it; else 404."""
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         require_conversation(http, client, conversation)
         person = memory.find_person(surface, user_id)
         info = memory.conversation_info(conversation)
@@ -639,7 +561,7 @@ def create_app(
     ) -> dict:
         """The conversations the account's person started on this surface, pinned first, then the last
         written in; `q` keeps those whose title, messages or summary contain it."""
-        require_surface(http, client, surface)
+        require_account(http, client, surface, user_id)
         person = memory.find_person(surface, user_id)
         found = memory.conversations_of(person.id, surface, q, limit) if person else []
         return {"conversations": [describe_conversation(info) for info in found]}
@@ -741,11 +663,15 @@ def create_app(
         return registry.describe(app.state.commands)
 
     @app.post("/v1/admin/command")
-    async def admin_command(body: CommandBody, admin: Admin) -> dict:
+    async def admin_command(body: CommandBody, admin: Admin, http: Request) -> dict:
         log.info("admin %s ran /%s", admin, body.line.lstrip("/").split(None, 1)[0])
         result = await registry.execute(body.line, app.state.commands)
+        if result.sensitive:
+            http.scope["clara_sensitive"] = True  # it holds a password: the traffic log does not keep it
         return {"output": result.output, "quit": result.quit}
 
+    install(app)
+    install_web(app)
     return app
 
 

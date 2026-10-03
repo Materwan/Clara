@@ -37,7 +37,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 log = logging.getLogger(__name__)
 
 FILE_PREFIX = "traffic-"
-SECRET_KEYS = re.compile(r"(?i)^(code|token|tokens|password|secret|api_?key|authorization)$")
+SECRET_KEYS = re.compile(r"(?i)^(.*password.*|code|token|tokens|secret|api_?key|authorization)$")
 REDACTED = "[redacted]"
 
 
@@ -250,10 +250,10 @@ class TrafficMiddleware:
     """ASGI middleware that logs every HTTP exchange with the clients. It never buffers a response: an
     event stream goes on flowing while it is logged."""
 
-    def __init__(self, app: Any, traffic: Callable[[], TrafficLog | None], identify: Callable[[str], str]):
+    def __init__(self, app: Any, traffic: Callable[[], TrafficLog | None], identify: Callable[[dict[str, str]], str]):
         self.app = app
         self._traffic = traffic  # read at each request: the log is created with the application's state
-        self._identify = identify  # Authorization header -> "client:<name>", "admin:<name>" or "anonymous"
+        self._identify = identify  # request headers -> "client:<name>", "admin:<name>", "user:<name>@<surface>" or "anonymous"
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         traffic = self._traffic() if scope["type"] == "http" else None
@@ -264,7 +264,7 @@ class TrafficMiddleware:
         exchange = new_id()
         started = time.monotonic()
         headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
-        common = {"id": exchange, "peer": self._identify(headers.get("authorization", ""))}
+        common = {"id": exchange, "peer": self._identify(headers)}
         client = scope.get("client")
         received: list[bytes] = []
         state = {"request_logged": False, "status": None, "sse": False, "events": 0, "tokens": 0, "size": 0}
@@ -327,6 +327,8 @@ class TrafficMiddleware:
             }
             if state["sse"]:
                 entry["events"], entry["tokens"] = state["events"], state["tokens"]
+            elif scope.get("clara_sensitive"):  # a password was handed out: the answer is not written
+                entry["body"] = REDACTED
             else:
                 entry["body"] = traffic.raw_body(b"".join(sent))
             traffic.record(entry)

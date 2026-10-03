@@ -111,6 +111,27 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_person ON conversations (person_id, surface, updated_at);
+CREATE TABLE IF NOT EXISTS users (
+    name          TEXT PRIMARY KEY,
+    person_id     INTEGER NOT NULL REFERENCES people (id),
+    password_hash TEXT NOT NULL,
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    last_login_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_person ON users (person_id);
+CREATE TABLE IF NOT EXISTS sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash   TEXT NOT NULL UNIQUE,
+    user         TEXT NOT NULL REFERENCES users (name) ON DELETE CASCADE,
+    surface      TEXT NOT NULL,
+    device       TEXT NOT NULL DEFAULT '',
+    address      TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user);
 """
 
 # Columns added after the first release: databases created before have to get them.
@@ -316,6 +337,15 @@ class Memory:
         )
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_key ON facts (person_id, text_key)")
 
+    @property
+    def database(self) -> sqlite3.Connection:
+        """The connection, for the stores that keep their tables in the same file (users.py)."""
+        return self._db
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
     def close(self) -> None:
         with self._lock:
             self._db.commit()
@@ -479,6 +509,7 @@ class Memory:
             self._db.execute("DELETE FROM reminder_events WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM facts WHERE person_id = ?", (person_id,))
             self._db.execute("DELETE FROM accounts WHERE person_id = ?", (person_id,))
+            self._db.execute("DELETE FROM users WHERE person_id = ?", (person_id,))  # their sessions go with them
             self._db.execute("DELETE FROM people WHERE id = ?", (person_id,))
             return found
 
@@ -498,6 +529,7 @@ class Memory:
         db.execute("UPDATE reminders SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("UPDATE reminder_events SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("UPDATE conversations SET person_id = ? WHERE person_id = ?", (target, source))
+        db.execute("UPDATE users SET person_id = ? WHERE person_id = ?", (target, source))
         db.execute("DELETE FROM people WHERE id = ?", (source,))
 
     # ------------------------------------------------------------------

@@ -20,6 +20,8 @@ from typing import Iterator
 import httpx
 from dotenv import load_dotenv
 
+from . import session
+
 SURFACE = "cli"
 
 HELP = """\
@@ -369,20 +371,31 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="clara-chat", description="Talk to a Clara server.")
     parser.add_argument("--url", default=os.getenv("CLARA_URL", "http://127.0.0.1:8765"))
-    parser.add_argument("--token", default=os.getenv("CLARA_TOKEN"), help="or CLARA_TOKEN")
-    parser.add_argument("--user", default=getpass.getuser(), help="your id on the 'cli' surface")
+    parser.add_argument("--token", default=os.getenv("CLARA_TOKEN"), help="a client token (CLARA_TOKEN), instead of a password")
+    parser.add_argument(
+        "--user", default=os.getenv("CLARA_USER") or getpass.getuser().lower(),
+        help="your user name (CLARA_USER): you sign in with its password, asked once (or CLARA_PASSWORD)",
+    )
+    parser.add_argument("--logout", action="store_true", help="forget the saved sign-in of this user and exit")
     parser.add_argument("--name", default=None, help="how Clara should call you")
     parser.add_argument("--conversation", default=None, help="thread id (default: cli:<user>)")
     parser.add_argument("message", nargs="*", help="one-shot: send this and exit")
     args = parser.parse_args()
-    if not args.token:
-        raise SystemExit("No token: pass --token or set CLARA_TOKEN.")
-
     for stream in (sys.stdout, sys.stderr):  # Windows consoles are not always UTF-8
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
 
-    api = ClaraApi(args.url, args.token, args.user, args.name, args.conversation or f"{SURFACE}:{args.user}")
+    if args.logout:
+        print("Signed out." if session.sign_out(args.url, args.user, SURFACE) else "No saved sign-in.")
+        return
+    token = args.token
+    if not token:  # a user with a password: the server gives a token bound to this user and surface
+        try:
+            token = session.obtain_token(args.url, args.user, SURFACE)
+        except session.LoginError as error:
+            raise SystemExit(f"Cannot sign in: {error}") from None
+
+    api = ClaraApi(args.url, token, args.user, args.name, args.conversation or f"{SURFACE}:{args.user}")
 
     def handle(line: str) -> bool:
         """Process one input line; False means: leave. Server errors are shown, not fatal."""
@@ -393,6 +406,10 @@ def main() -> None:
         except httpx.ConnectError:
             print(f"! Cannot reach the Clara server at {args.url}.")
         except httpx.HTTPStatusError as error:
+            if error.response.status_code == 401 and not args.token:
+                session.forget(args.url, args.user, SURFACE)
+                print("! You were signed out. Start clara-chat again and enter your password.")
+                return False
             print(f"! Server said {error.response.status_code}: {error.response.text}")
         return True
 

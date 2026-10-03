@@ -14,6 +14,7 @@ dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.0",
     "prompt_toolkit>=3.0",
+    "pypdf>=4.0",  # the text of PDF documents attached on the web site
     "tzdata; sys_platform == 'win32'",  # Windows has no timezone database of its own
 ]
 
@@ -27,6 +28,9 @@ clara-admin = "clara.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+clara = ["web/*"]  # the web site
 
 [tool.ruff]
 line-length = 120

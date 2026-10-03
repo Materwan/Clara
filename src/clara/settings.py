@@ -66,6 +66,17 @@ def parse_client_surfaces(raw: str, clients: set[str]) -> dict[str, frozenset[st
     return allowed
 
 
+def parse_user_surfaces(raw: str) -> frozenset[str]:
+    """`"web,app"` -> the surfaces a user may log in on."""
+    surfaces = frozenset(part.strip().lower() for part in raw.replace("|", ",").split(",") if part.strip())
+    if not surfaces:
+        raise SettingsError("CLARA_USER_SURFACES is empty: no user could log in anywhere")
+    for surface in surfaces:
+        if not SURFACE_RE.match(surface):
+            raise SettingsError(f"CLARA_USER_SURFACES: bad surface {surface!r} (a-z, 0-9, _ -)")
+    return surfaces
+
+
 def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
     raw = env.get(key, "").strip()
     if not raw:
@@ -150,6 +161,10 @@ class Settings:
     # An address that sends this many bad tokens in a minute is refused for the next block (0: never)
     auth_max_failures: int = 10
     auth_block_seconds: int = 300
+    # Users who log in with a password (users.py): days a token lasts without being used (0: for ever), and
+    # the surfaces a login may be made on (a user token is bound to one of them)
+    session_days: int = 90
+    user_surfaces: frozenset[str] = frozenset({"web", "app", "cli", "console"})
 
     @property
     def logs_dir(self) -> Path:
@@ -261,4 +276,6 @@ class Settings:
             tailscale_bin=text("CLARA_TAILSCALE_BIN", "tailscale"),
             auth_max_failures=_non_negative_int(env, "CLARA_AUTH_MAX_FAILURES", 10),
             auth_block_seconds=_positive_int(env, "CLARA_AUTH_BLOCK_SECONDS", 300),
+            session_days=_non_negative_int(env, "CLARA_SESSION_DAYS", 90),
+            user_surfaces=parse_user_surfaces(text("CLARA_USER_SURFACES", "web,app,cli,console")),
         )
