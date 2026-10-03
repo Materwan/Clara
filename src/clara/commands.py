@@ -19,6 +19,7 @@ from .memory import Memory, Person
 from .notifications import Notifier
 from .providers import ProviderError, ProviderManager
 from .settings import Settings
+from .tailscale import Tailscale
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class CommandContext:
     listen: str  # "127.0.0.1:8765"
     lifecycle: Lifecycle | None = None
     notifier: Notifier | None = None  # tells everybody when the provider or the model changes
+    tailscale: Tailscale | None = None  # how the server is published, if it is
 
     def tell_everybody(self, text: str) -> None:
         if self.notifier is not None:
@@ -203,7 +205,9 @@ async def status_command(ctx: CommandContext, args: str) -> str:
         ["Tokens", f"{stats.prompt_tokens:,} prompt / {stats.completion_tokens:,} completion"],
         ["Memory", f"{people} people, {facts} facts ({ctx.settings.db_path})"],
     ]
-    return "\n".join(f"{label:<9}{value}" for label, value in rows)
+    if ctx.tailscale is not None and ctx.tailscale.enabled:
+        rows.insert(3, ["Tailscale", ctx.tailscale.describe()])
+    return "\n".join(f"{label:<10}{value}" for label, value in rows)
 
 
 @registry.command(

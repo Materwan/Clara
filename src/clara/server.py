@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import secrets
 import sys
 import time
@@ -68,8 +69,10 @@ from .memory import MAX_TITLE_LENGTH, ConversationInfo, Memory, MergeRefused, Pe
 from .notifications import MAX_TARGETS, MAX_TEXT, MAX_TITLE, SURFACE_RE, NotificationError, Notifier
 from .prompt import SystemPrompt
 from .providers import ProviderManager
+from .ratelimit import FailureLimiter
 from .reminders import ReminderError, ReminderService, describe
 from .settings import Settings, SettingsError
+from .tailscale import Tailscale
 from .tools import default_toolbox
 from .traffic import TrafficLog, TrafficMiddleware
 
@@ -200,9 +203,27 @@ def _caller(request: Request, tokens: dict[str, str]) -> str | None:
     return caller
 
 
+def _checked_caller(request: Request, tokens: dict[str, str]) -> str | None:
+    """`_caller`, except that an address sending too many wrong tokens is refused (429) for a while."""
+    limiter: FailureLimiter = request.app.state.auth_limiter
+    address = request.client.host if request.client else None
+    wait = limiter.blocked_for(address)
+    if wait:
+        raise HTTPException(
+            429, "Too many wrong tokens from this address: try again later.",
+            headers={"Retry-After": str(math.ceil(wait))},
+        )
+    caller = _caller(request, tokens)
+    if caller is not None:
+        limiter.succeeded(address)
+    elif limiter.failed(address):
+        log.warning("%s sent %d wrong tokens: refused for %d s", address, limiter.max_failures, limiter.block_seconds)
+    return caller
+
+
 def authenticate(request: Request) -> str:
-    """Name of the calling chat client, or 401."""
-    caller = _caller(request, request.app.state.settings.tokens)
+    """Name of the calling chat client, or 401 (429 after too many wrong tokens)."""
+    caller = _checked_caller(request, request.app.state.settings.tokens)
     if caller is None:
         raise HTTPException(401, "Missing or invalid token", headers={"WWW-Authenticate": "Bearer"})
     return caller
@@ -213,7 +234,7 @@ def authenticate_admin(request: Request) -> str:
     tokens = request.app.state.settings.admin_tokens
     if not tokens:
         raise HTTPException(403, "Remote admin is disabled: set CLARA_ADMIN_TOKENS")
-    caller = _caller(request, tokens)
+    caller = _checked_caller(request, tokens)
     if caller is None:
         raise HTTPException(
             401, "Missing or invalid admin token", headers={"WWW-Authenticate": "Bearer"}
@@ -284,7 +305,9 @@ async def with_keepalive(events: AsyncIterator[dict], interval: float = KEEPALIV
             await iterator.aclose()  # type: ignore[attr-defined]
 
 
-def create_app(settings: Settings, providers: ProviderManager | None = None) -> FastAPI:
+def create_app(
+    settings: Settings, providers: ProviderManager | None = None, tailscale: Tailscale | None = None
+) -> FastAPI:
     memory = Memory(settings.db_path)
     link_codes = LinkCodes()
     for name in settings.unrestricted_clients:
@@ -325,14 +348,28 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         ai_timeout = float(settings.reminder_ai_timeout)
         reminders.composer = lambda reminder: compose(agent, reminder, ai_timeout)
     lifecycle = Lifecycle(agent, reminders)
+    tailscale = tailscale or Tailscale.from_settings(settings)
+    if tailscale.enabled:
+        if settings.host not in ("127.0.0.1", "localhost", "::1"):
+            log.warning(
+                "CLARA_HOST=%s: the port is reachable without Tailscale too; keep 127.0.0.1 with CLARA_TAILSCALE",
+                settings.host,
+            )
+        if tailscale.public and settings.admin_tokens:
+            log.warning("CLARA_TAILSCALE=funnel: the remote admin console (CLARA_ADMIN_TOKENS) is public too")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         lifecycle.loop = asyncio.get_running_loop()
         scheduler = asyncio.create_task(reminders.run())
+        publishing = asyncio.create_task(tailscale.start())  # slow if tailscale hangs: not before the server is up
         try:
             yield
         finally:
+            publishing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await publishing
+            await tailscale.stop()
             scheduler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await scheduler
@@ -345,6 +382,8 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
         TrafficMiddleware, traffic=lambda: traffic, identify=lambda header: peer_of(settings, header)
     )
     app.state.settings = settings
+    app.state.auth_limiter = FailureLimiter(settings.auth_max_failures, settings.auth_block_seconds)
+    app.state.tailscale = tailscale
     app.state.memory = memory
     app.state.agent = agent
     app.state.reminders = reminders
@@ -354,7 +393,7 @@ def create_app(settings: Settings, providers: ProviderManager | None = None) -> 
     app.state.providers = providers
     app.state.commands = CommandContext(
         settings, memory, agent, providers, time.monotonic(), f"{settings.host}:{settings.port}", lifecycle,
-        notifier,
+        notifier, tailscale,
     )
 
     def known_person(surface: Surface, user_id: ExternalId) -> Person:
@@ -744,11 +783,19 @@ class ClaraServer(uvicorn.Server):
         self.lifecycle.request_stop_threadsafe(force=self.lifecycle.stopping)
 
 
+def uvicorn_config(app: FastAPI, settings: Settings, **options: Any) -> uvicorn.Config:
+    # tailscaled proxies from this machine: trust its X-Forwarded-For, so logs and the limit of wrong tokens
+    # see the real client (nothing else is trusted: anyone else could write whatever address they like)
+    options = {"host": settings.host, "port": settings.port, "proxy_headers": True,
+               "forwarded_allow_ips": "127.0.0.1,::1", **options}
+    return uvicorn.Config(app, **options)
+
+
 async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
     """Run the HTTP server, plus the interactive console on the same event loop."""
     lifecycle: Lifecycle = app.state.lifecycle
     if not with_console:
-        await ClaraServer(uvicorn.Config(app, host=settings.host, port=settings.port), lifecycle).serve()
+        await ClaraServer(uvicorn_config(app, settings), lifecycle).serve()
         return
 
     from prompt_toolkit.patch_stdout import patch_stdout
@@ -758,9 +805,7 @@ async def serve(app: FastAPI, settings: Settings, with_console: bool) -> None:
     # Everything is created inside patch_stdout so server logs print above the prompt
     with patch_stdout():
         configure_logging()  # again: the handler must capture the patched stderr
-        server = ClaraServer(
-            uvicorn.Config(app, host=settings.host, port=settings.port, access_log=False), lifecycle
-        )
+        server = ClaraServer(uvicorn_config(app, settings, access_log=False), lifecycle)
         server_task = asyncio.create_task(server.serve())
         while not server.started and not server_task.done():
             await asyncio.sleep(0.05)

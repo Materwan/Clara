@@ -3,9 +3,10 @@
 #   (edit User and the paths below)
 #   sudo systemctl daemon-reload && sudo systemctl enable --now clara
 # Logs: journalctl -u clara -f
+# With CLARA_TAILSCALE: sudo tailscale set --operator=clara   (lets the service user drive tailscale)
 [Unit]
 Description=Clara AI server
-After=network-online.target
+After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]

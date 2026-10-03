@@ -279,7 +279,7 @@ class TrafficMiddleware:
                 {
                     "dir": "in", "kind": "request", **common, "method": scope["method"], "path": scope["path"],
                     "query": scope.get("query_string", b"").decode("latin-1"),
-                    "from": f"{client[0]}:{client[1]}" if client else None,
+                    "from": (f"{client[0]}:{client[1]}" if client[1] else client[0]) if client else None,  # port 0: forwarded
                     "body": traffic.raw_body(b"".join(received)),
                 }
             )

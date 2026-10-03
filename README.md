@@ -376,15 +376,69 @@ listen and say "Clara is stopping / is not running / is running again".
   token to its surfaces: facts, conversations and accounts of other surfaces answer 403. A client
   with no entry may use any surface (the server warns at startup). Do not hand a token to anything
   you don't control.
-- It listens on `127.0.0.1` by default. To reach it from another machine, put
-  it behind a VPN such as Tailscale or an HTTPS reverse proxy rather than
-  exposing the port.
+- It listens on `127.0.0.1` by default. To reach it from another machine, use Tailscale
+  (see *Reaching the server with Tailscale*) or an HTTPS reverse proxy rather than exposing the port.
+- An address that sends `CLARA_AUTH_MAX_FAILURES` (10) wrong tokens within a minute is refused with HTTP 429
+  for `CLARA_AUTH_BLOCK_SECONDS` (300), even with the right token. This machine itself is never counted.
 - Facts are given to the model as *data*; the prompt says they are not instructions.
+
+## Reaching the server with Tailscale
+
+When you cannot forward a port (CGNAT, a router you do not control), Tailscale gives the server an HTTPS
+address without opening anything. Set in `.env`:
+
+```
+CLARA_TAILSCALE=serve      # or funnel
+```
+
+| Mode | Who can reach it | Clients need |
+| --- | --- | --- |
+| `serve` | the devices of your tailnet | Tailscale installed and logged in |
+| `funnel` | the whole internet | nothing, only the URL and a token |
+
+At startup the server finds its name (`tailscale status --json`) and runs `tailscale serve|funnel --bg
+--https=<port> http://127.0.0.1:8765`; tailscaled terminates HTTPS and forwards to the server, which keeps
+listening on localhost only. The address (`https://<machine>.<tailnet>.ts.net`) is in the log and in `/status`.
+When the server exits it removes the mapping. If Tailscale cannot be used (not installed, not logged in,
+Funnel not allowed...) the server **starts anyway**, on localhost, and says why in the log and in `/status`.
+The first DNS lookup of a new address can take several minutes to work from outside.
+
+**Once, on the machine** (Ubuntu):
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+Then in the admin console (https://login.tailscale.com/admin/dns) turn on **MagicDNS** and **HTTPS
+certificates**; for `funnel`, the machine must also be allowed to use Funnel (policy `nodeAttrs` with
+`funnel`, which new tailnets have for all members). If Clara runs as its own user (the systemd unit), let that
+user drive Tailscale: `sudo tailscale set --operator=clara`.
+
+**On the clients**, use the HTTPS address as the server: `clara-chat --url https://box.tail1234.ts.net`
+(`CLARA_URL`), the same for `clara-admin`, the Server field of the desktop app.
+
+Settings (`.env.example`): `CLARA_TAILSCALE` (`off`, `serve`, `funnel`), `CLARA_TAILSCALE_PORT` (443, 8443 or
+10000: the only HTTPS ports Tailscale offers; Clara owns it while this is on), `CLARA_TAILSCALE_BIN`.
+
+**With `funnel`**, anyone who finds the address can try tokens, so:
+
+- every token (chat and admin) must have at least 32 characters, or the server refuses to start;
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"` makes one;
+- the remote admin console (`CLARA_ADMIN_TOKENS`) is public as well: leave it empty unless you need it;
+- wrong tokens are limited per address (see *Security*), and the traffic log shows the real address of each
+  request in `from`: the server trusts `X-Forwarded-For` from `127.0.0.1` and `::1` only, which is where
+  tailscaled connects from.
+- the traffic log holds everything people say (see *Traffic log*).
+
+Keep `CLARA_HOST=127.0.0.1`: with `0.0.0.0` the plain HTTP port stays reachable on your network too (the
+server warns).
 
 ## Running on a Linux server
 
 See `deploy/clara.service` (systemd). Ollama must be reachable from the server
-(`OLLAMA_HOST`), or use a `-cloud` model.
+(`OLLAMA_HOST`), or use a `-cloud` model. To publish it with Tailscale, see above; the service starts after
+`tailscaled`.
 
 ## Layout
 
@@ -397,6 +451,8 @@ src/clara/
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
   reminders.py  reminders: parsing, repeats, the scheduler
+  tailscale.py  publishes the server with `tailscale serve|funnel`, removes it on exit
+  ratelimit.py  refuses an address that sends too many wrong tokens
   notifications.py  notifications, and each listener's stream of events (reminders, notifications, server state)
   announce.py   Clara writes the announcement of a reminder that came due
   traffic.py    the traffic log: every request in and out, in data/logs
