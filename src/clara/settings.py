@@ -10,12 +10,16 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
+from .tailscale import HTTPS_PORTS
+from .tailscale import MODES as TAILSCALE_MODES
+
 
 class SettingsError(Exception):
     pass
 
 
 PLACEHOLDER_TOKEN = "change-me"  # what .env.example ships with
+MIN_PUBLIC_TOKEN_LENGTH = 32  # `secrets.token_urlsafe(32)` gives 43; a Funnel URL is open to the whole internet
 SURFACE_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
@@ -60,6 +64,17 @@ def parse_client_surfaces(raw: str, clients: set[str]) -> dict[str, frozenset[st
                 raise SettingsError(f"CLARA_CLIENT_SURFACES: bad surface {surface!r} (a-z, 0-9, _ -)")
         allowed[name] = names | allowed.get(name, frozenset())
     return allowed
+
+
+def parse_user_surfaces(raw: str) -> frozenset[str]:
+    """`"web,app"` -> the surfaces a user may log in on."""
+    surfaces = frozenset(part.strip().lower() for part in raw.replace("|", ",").split(",") if part.strip())
+    if not surfaces:
+        raise SettingsError("CLARA_USER_SURFACES is empty: no user could log in anywhere")
+    for surface in surfaces:
+        if not SURFACE_RE.match(surface):
+            raise SettingsError(f"CLARA_USER_SURFACES: bad surface {surface!r} (a-z, 0-9, _ -)")
+    return surfaces
 
 
 def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
@@ -139,6 +154,17 @@ class Settings:
     traffic_log: bool = True
     traffic_log_days: int = 30  # files older than this are deleted
     traffic_log_max_body: int = 100_000  # characters kept of each body
+    # Tailscale (tailscale.py): off | serve (your tailnet) | funnel (the internet), on an HTTPS port
+    tailscale: str = "off"
+    tailscale_port: int = 443
+    tailscale_bin: str = "tailscale"
+    # An address that sends this many bad tokens in a minute is refused for the next block (0: never)
+    auth_max_failures: int = 10
+    auth_block_seconds: int = 300
+    # Users who log in with a password (users.py): days a token lasts without being used (0: for ever), and
+    # the surfaces a login may be made on (a user token is bound to one of them)
+    session_days: int = 90
+    user_surfaces: frozenset[str] = frozenset({"web", "app", "cli", "console"})
 
     @property
     def logs_dir(self) -> Path:
@@ -184,6 +210,25 @@ class Settings:
         if set(tokens) & set(admin_tokens):
             raise SettingsError("A token cannot be both a chat token and an admin token.")
 
+        tailscale = text("CLARA_TAILSCALE", "off").lower()
+        if tailscale not in TAILSCALE_MODES:
+            raise SettingsError(f"CLARA_TAILSCALE must be one of {', '.join(TAILSCALE_MODES)}")
+        tailscale_port = _positive_int(env, "CLARA_TAILSCALE_PORT", 443)
+        if tailscale_port not in HTTPS_PORTS:
+            raise SettingsError(
+                f"CLARA_TAILSCALE_PORT must be one of {', '.join(map(str, HTTPS_PORTS))} (Tailscale's HTTPS ports)"
+            )
+        if tailscale == "funnel":
+            weak = sorted(
+                {name for token, name in (*tokens.items(), *admin_tokens.items()) if len(token) < MIN_PUBLIC_TOKEN_LENGTH}
+            )
+            if weak:
+                raise SettingsError(
+                    f"CLARA_TAILSCALE=funnel puts the server on the public internet: the token(s) of {', '.join(weak)} "
+                    f"have fewer than {MIN_PUBLIC_TOKEN_LENGTH} characters. Generate real ones with:\n"
+                    '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+                )
+
         client_surfaces = parse_client_surfaces(
             env.get("CLARA_CLIENT_SURFACES", ""), set(tokens.values())
         )
@@ -226,4 +271,11 @@ class Settings:
             traffic_log=_flag(env, "CLARA_TRAFFIC_LOG", default=True),
             traffic_log_days=_positive_int(env, "CLARA_TRAFFIC_LOG_DAYS", 30),
             traffic_log_max_body=_positive_int(env, "CLARA_TRAFFIC_LOG_MAX_BODY", 100_000),
+            tailscale=tailscale,
+            tailscale_port=tailscale_port,
+            tailscale_bin=text("CLARA_TAILSCALE_BIN", "tailscale"),
+            auth_max_failures=_non_negative_int(env, "CLARA_AUTH_MAX_FAILURES", 10),
+            auth_block_seconds=_positive_int(env, "CLARA_AUTH_BLOCK_SECONDS", 300),
+            session_days=_non_negative_int(env, "CLARA_SESSION_DAYS", 90),
+            user_surfaces=parse_user_surfaces(text("CLARA_USER_SURFACES", "web,app,cli,console")),
         )

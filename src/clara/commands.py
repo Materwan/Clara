@@ -19,6 +19,8 @@ from .memory import Memory, Person
 from .notifications import Notifier
 from .providers import ProviderError, ProviderManager
 from .settings import Settings
+from .tailscale import Tailscale
+from .users import UserError, Users, generate_password
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ class CommandError(Exception):
 class CommandResult:
     output: str = ""
     quit: bool = False  # the console should close
+    sensitive: bool = False  # the output holds a password: not to be written in a log
 
 
 @dataclass
@@ -45,6 +48,8 @@ class CommandContext:
     listen: str  # "127.0.0.1:8765"
     lifecycle: Lifecycle | None = None
     notifier: Notifier | None = None  # tells everybody when the provider or the model changes
+    tailscale: Tailscale | None = None  # how the server is published, if it is
+    users: Users | None = None  # people who log in with a password
 
     def tell_everybody(self, text: str) -> None:
         if self.notifier is not None:
@@ -203,7 +208,9 @@ async def status_command(ctx: CommandContext, args: str) -> str:
         ["Tokens", f"{stats.prompt_tokens:,} prompt / {stats.completion_tokens:,} completion"],
         ["Memory", f"{people} people, {facts} facts ({ctx.settings.db_path})"],
     ]
-    return "\n".join(f"{label:<9}{value}" for label, value in rows)
+    if ctx.tailscale is not None and ctx.tailscale.enabled:
+        rows.insert(3, ["Tailscale", ctx.tailscale.describe()])
+    return "\n".join(f"{label:<10}{value}" for label, value in rows)
 
 
 @registry.command(
@@ -359,3 +366,87 @@ async def link_command(ctx: CommandContext, args: str) -> str:
     ctx.memory.link_account(surface, external_id, target, force=True)
     accounts = ", ".join(f"{s}:{e}" for s, e in ctx.memory.accounts_of(target.id))
     return f"{target.name} now has: {accounts}"
+
+
+USER_ACTIONS = ["list", "add", "passwd", "admin", "disable", "enable", "remove", "logout"]
+
+
+@registry.command(
+    "user",
+    "[list | add <name> [admin] | passwd <name> | admin <name> on|off | disable|enable|remove|logout <name>]",
+    "People who log in with a password: add one (a password is made and shown once), reset it, sign out",
+    lambda ctx: USER_ACTIONS,
+)
+async def user_command(ctx: CommandContext, args: str) -> CommandResult | str:
+    users = ctx.users
+    if users is None:
+        raise CommandError("This server has no user accounts.")
+    verb, _, rest = args.strip().partition(" ")
+    verb, words = verb.lower() or "list", rest.split()
+
+    def named() -> str:
+        if not words:
+            raise CommandError(f"Usage: /user {verb} <name>")
+        return words[0].lower()
+
+    try:
+        if verb == "list":
+            found = users.list()
+            if not found:
+                return "Nobody can log in yet. Add someone: /user add <name> admin"
+            rows = []
+            for user in found:
+                person = ctx.memory.person_by_id(user.person_id)
+                state = "disabled" if user.disabled else ("admin" if user.is_admin else "user")
+                rows.append(
+                    [user.name, state, f"{person.name} (id {person.id})" if person else "?",
+                     str(len(users.sessions_of(user.name))), (user.last_login_at or "never")[:16].replace("T", " ")]
+                )
+            return table(["name", "role", "person", "devices", "last login"], rows)
+
+        if verb == "add":
+            name = named()
+            flags = [word.lower() for word in words[1:]]
+            if any(flag != "admin" for flag in flags):
+                raise CommandError("Usage: /user add <name> [admin]")
+            password = generate_password()
+            user = users.create(name, password, admin="admin" in flags)
+            person = ctx.memory.person_by_id(user.person_id)
+            return CommandResult(
+                f"Created {user.name}{' (administrator)' if user.is_admin else ''}, the person {person.name} (id {person.id}).\n"
+                f"Password: {password}\n"
+                "Shown once. They can change it on the web site (Account), or you can reset it: /user passwd " + user.name,
+                sensitive=True,
+            )
+
+        if verb == "passwd":
+            name = named()
+            password = generate_password()
+            signed_out = users.set_password(name, password)
+            return CommandResult(
+                f"New password for {name}: {password}\nShown once. {signed_out} device(s) were signed out.",
+                sensitive=True,
+            )
+
+        if verb == "admin":
+            name = named()
+            if len(words) != 2 or words[1].lower() not in ("on", "off"):
+                raise CommandError("Usage: /user admin <name> on|off")
+            users.set_admin(name, words[1].lower() == "on")
+            return f"{name} is {'now' if words[1].lower() == 'on' else 'no longer'} an administrator."
+
+        if verb in ("disable", "enable"):
+            name = named()
+            users.set_disabled(name, verb == "disable")
+            return f"{name} is {'disabled and signed out everywhere' if verb == 'disable' else 'enabled again'}."
+
+        if verb == "remove":
+            name = named()
+            users.delete(name)
+            return f"{name} can no longer log in. Their person, facts and conversations are kept (/forget-person erases them)."
+
+        if verb == "logout":
+            return f"{users.revoke_all(named())} device(s) signed out."
+    except UserError as error:
+        raise CommandError(str(error)) from None
+    raise CommandError(f"Unknown action {verb!r}. Try /help user.")

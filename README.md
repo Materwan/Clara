@@ -13,6 +13,9 @@ are thin clients: they send a message, they show the answer.
 
 Runs the same on Linux and Windows (pure Python, SQLite, no native extension).
 
+It also serves a **web site** (open the server's address in a browser): sign in with a user name and a password,
+chat, see what Clara remembers, and, for administrators, manage users and the server. See *Users* and *The web site*.
+
 ## Quick start
 
 ```bash
@@ -35,8 +38,14 @@ Tests: `pytest`. Lint: `ruff check .` (both run in CI on Linux and Windows, Pyth
 ## The console
 
 Started in a terminal, `clara-server` shows a prompt beside the server logs
-(history, Tab completion). Without a terminal (systemd) or with
-`--no-console`, there is no prompt.
+(history, Tab completion). Without a terminal (systemd) there is no prompt.
+
+Two options change how it starts (they exclude each other):
+
+| Option | |
+| --- | --- |
+| `--headless` (alias `--no-console`) | No prompt, and **the server survives the end of its terminal**: closing an SSH session no longer kills it. It ignores SIGHUP, lets go of the terminal's input and output, and logs to `data/logs/clara-server.log` (5 files of 5 MB). Start it with `clara-server --headless &` (or `nohup`, tmux, systemd: it works the same), stop it with `kill <pid>` (SIGTERM stops it the careful way, see *Stopping the server*) or `clara-admin /stop`. Windows has no SIGHUP: there it only drops the console and logs to the file. |
+| `--test` | Before the prompt appears, checks the installation and shows the state of each check (`PASS`, `WARN`, `FAIL`, `SKIP`): configuration, data directory writable, database sound, system prompt, web site files, port free, model provider reachable and model installed, Tailscale. Nothing is changed. When nothing failed it goes on to start normally; when a check failed it asks `Start anyway? [y/N]` (and does not start when there is no terminal to ask on, exit code 1). |
 
 To use the same console **from another computer**, set `CLARA_ADMIN_TOKENS` on
 the server and run:
@@ -128,8 +137,12 @@ All routes except `/health` need `Authorization: Bearer <token>`.
 | `POST /v1/accounts/link-code` | `{surface, user_id}` → `{code, expires_in}`: proof of control of that account |
 | `POST /v1/accounts/link` | `{surface, user_id, code, to_surface, to_user_id}`; 403 bad code, 409 both accounts have memories |
 | `DELETE /v1/conversations/{id}?surface=&user_id=` | forget a thread, keep the facts; with an account, only one its person started (404 otherwise) |
+| `POST /v1/auth/login` | `{username, password, surface?, device?}` → `{token, user, surface}`; with the header `X-Clara-Web: 1` (the web site) the token goes in an HttpOnly cookie instead; 401 wrong, 403 surface not allowed, 409 accounts cannot be merged, 429 too many tries (see *Users*) |
+| `POST /v1/auth/logout`, `GET /v1/auth/me`, `POST /v1/auth/password` `{current_password, new_password}`, `GET /v1/auth/sessions`, `DELETE /v1/auth/sessions/{id}` | the signed-in user's own account and devices |
+| `POST /v1/documents/extract` | the bytes of a PDF as the body → `{text, pages, truncated}` |
 | `GET /health` | no auth; shows the active provider and model |
-| `GET /v1/admin/commands`, `POST /v1/admin/command` | `{line}` → `{output, quit}`; **admin token** only (used by `clara-admin`) |
+| `GET /v1/admin/commands`, `POST /v1/admin/command` | `{line}` → `{output, quit}`; an **admin token** or an administrator user (used by `clara-admin`) |
+| `GET/POST /v1/admin/users`, `PATCH/DELETE /v1/admin/users/{name}`, `POST .../sign-out`, `GET /v1/admin/status`, `GET /v1/admin/models`, `GET /v1/admin/people`, `GET/POST .../people/{id}/facts`, `DELETE .../facts/{fact}`, `GET .../people/{id}/footprint` | what the web site's administration page uses; same rights as above |
 
 `conversation` defaults to `<surface>:<user_id>` (a private thread). A group
 client such as a Discord channel should pass its own id (`discord:channel:42`);
@@ -313,6 +326,72 @@ from now, with no backlog. An event is delivered at least once: if the connectio
 sent, it comes again on reconnection. Two connections of the same listener both get what fires while they
 are open, but share what they missed.
 
+## Users
+
+A **user** is a name and a password. Signing in gives a token that is bound to that user and to one *surface*, so
+the server knows who is speaking and refuses anything that claims otherwise (HTTP 403): a user cannot read
+another's conversations or facts, whatever the request says. One user is **one person on every surface**: signing in
+on the web, in the desktop app and in the terminal gives the same memories and the same conversations list per
+surface, with no link codes.
+
+| Surface | Used by |
+| --- | --- |
+| `web` | the web site |
+| `app` | the desktop app (`clara-app`) |
+| `cli` | `clara-chat` |
+| `console` | `custom-console`, and `clara-admin` |
+
+`CLARA_USER_SURFACES` lists the surfaces a user may sign in on (those four by default).
+
+**Making users** is the administrator's job, in the server's console or from another computer
+(`clara-admin "/user add erwan admin"`):
+
+| | |
+| --- | --- |
+| `/user add <name> [admin]` | makes the user and **a password, shown once** (it never passes through the traffic log) |
+| `/user passwd <name>` | a new password; the user is signed out everywhere |
+| `/user admin <name> on\|off`, `/user disable <name>`, `/user enable <name>`, `/user remove <name>` | roles and access. The last administrator cannot be demoted, disabled or removed |
+| `/user logout <name>` | signs a user out of all their devices |
+| `/user list` | users, roles, devices, last sign-in |
+
+The same things are on the web site's *Admin* page, where a password can also be typed instead of generated. A user
+changes their own password on the *Account* page, which signs out their other devices.
+
+A user takes over the memories of accounts that already have their name: `/user add erwan` finds `cli:erwan`,
+`app:erwan`... and the user is that person. Signing in on a surface joins its account (`app:erwan`) to them; if both
+already have memories, signing in is refused (409) and an operator merges them with `/link`.
+
+**Tokens.** Signing in returns a random token (`clu_...`). The server keeps its hash only, and it works until it is
+revoked (sign out, a new password, the user being disabled or removed) or has been unused for `CLARA_SESSION_DAYS`
+days (90; `0` = never). Programs keep the token, not the password: `clara-chat` and `clara-admin` ask for the password
+once and save the token (`%APPDATA%\clara\sessions.json`, or `~/.config/clara/`; `clara-chat --logout` forgets it);
+the desktop app asks in its settings; `custom-console` signs in by itself with `CLARA_USER` / `CLARA_PASSWORD`.
+Wrong passwords are limited per address (see *Security*).
+
+**The first administrator.** The server's own console can do it. Under systemd there is none, so use
+`CLARA_ADMIN_TOKENS` once: `clara-admin --token <admin token> "/user add erwan admin"`.
+
+## The web site
+
+`http://127.0.0.1:8765/` (or the Tailscale address) opens Clara in a browser, with the surface `web`:
+
+- **Chat**: answers stream in as Markdown; your conversations at the side (search, pin, rename, delete, titles
+  written by Clara); a bar showing how full the context is and *Summarise* to compact it; documents with 📎, by
+  drag and drop or by pasting: PDFs are read by the server (`pypdf`), text and code in the browser, as in the desktop app.
+- **Memory**: what Clara remembers about you, to add to or remove from.
+- **Account**: change your password, see and sign out your devices, link an account that has no password (Discord)
+  with a link code.
+- **Admin** (administrators): *Users* (add, reset a password, make administrator, disable, sign out, remove),
+  *Server* (status, switch provider and model, stop), *People & memory* (everybody Clara knows, their facts,
+  linking, erasing a person) and a *Console* box with every server command.
+
+There are no reminders or notifications on the web site, and it runs no tools on your computer.
+
+It is plain HTML, CSS and JavaScript in `src/clara/web/`, with no build step and nothing loaded from elsewhere. The
+browser keeps your sign-in in an HttpOnly cookie (out of reach of scripts) and the server only honours it when the
+request has the header `X-Clara-Web: 1`, which a page of another site cannot add. Everything it shows is built from
+text nodes; the page's Content-Security-Policy allows only its own files.
+
 ## Traffic log
 
 Every request that comes in or goes out is written to `data/logs/traffic-<date>.jsonl` (one file per UTC day,
@@ -369,22 +448,83 @@ listen and say "Clara is stopping / is not running / is running again".
 
 ## Security
 
-- Tokens are required; the server refuses to start without any. Use one token
-  per client so one can be revoked alone.
-- Clients are **trusted** within their surfaces: a token proves which client calls, and the client
+- **People sign in with a password** (see *Users*); the server then knows who is speaking, and a token it
+  gives cannot act as anybody else. Passwords are kept only as salted scrypt hashes; the tokens only as
+  SHA-256 hashes; neither is ever written to the traffic log.
+- Client tokens (`CLARA_TOKENS`) are required; the server refuses to start without any. They are for programs
+  (the Discord bot) that speak for several people. Use one token per client so one can be revoked alone.
+- Clients with such a token are **trusted** within their surfaces: a token proves which client calls, and the client
   says who is speaking. `CLARA_CLIENT_SURFACES` (`terminal=cli|console,discord=discord`) limits each
   token to its surfaces: facts, conversations and accounts of other surfaces answer 403. A client
   with no entry may use any surface (the server warns at startup). Do not hand a token to anything
   you don't control.
-- It listens on `127.0.0.1` by default. To reach it from another machine, put
-  it behind a VPN such as Tailscale or an HTTPS reverse proxy rather than
-  exposing the port.
+- It listens on `127.0.0.1` by default. To reach it from another machine, use Tailscale
+  (see *Reaching the server with Tailscale*) or an HTTPS reverse proxy rather than exposing the port.
+- An address that sends `CLARA_AUTH_MAX_FAILURES` (10) wrong tokens or passwords within a minute is refused with
+  HTTP 429 for `CLARA_AUTH_BLOCK_SECONDS` (300), even with the right one. This machine itself is never counted.
 - Facts are given to the model as *data*; the prompt says they are not instructions.
+
+## Reaching the server with Tailscale
+
+When you cannot forward a port (CGNAT, a router you do not control), Tailscale gives the server an HTTPS
+address without opening anything. Set in `.env`:
+
+```
+CLARA_TAILSCALE=serve      # or funnel
+```
+
+| Mode | Who can reach it | Clients need |
+| --- | --- | --- |
+| `serve` | the devices of your tailnet | Tailscale installed and logged in |
+| `funnel` | the whole internet | nothing, only the URL and a token |
+
+At startup the server finds its name (`tailscale status --json`) and runs `tailscale serve|funnel --bg
+--https=<port> http://127.0.0.1:8765`; tailscaled terminates HTTPS and forwards to the server, which keeps
+listening on localhost only. The address (`https://<machine>.<tailnet>.ts.net`) is in the log and in `/status`.
+When the server exits it removes the mapping. If Tailscale cannot be used (not installed, not logged in,
+Funnel not allowed...) the server **starts anyway**, on localhost, and says why in the log and in `/status`.
+The first DNS lookup of a new address can take several minutes to work from outside.
+
+**Once, on the machine** (Ubuntu):
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+Then in the admin console (https://login.tailscale.com/admin/dns) turn on **MagicDNS** and **HTTPS
+certificates**; for `funnel`, the machine must also be allowed to use Funnel (policy `nodeAttrs` with
+`funnel`, which new tailnets have for all members). If Clara runs as its own user (the systemd unit), let that
+user drive Tailscale: `sudo tailscale set --operator=clara`.
+
+**The web site** is at that same address: open `https://box.tail1234.ts.net` in a browser. With `funnel` its sign-in
+page is public too; with `serve` only your tailnet sees it. On the machine itself it is `http://127.0.0.1:8765`.
+
+**On the clients**, use the HTTPS address as the server: `clara-chat --url https://box.tail1234.ts.net`
+(`CLARA_URL`), the same for `clara-admin`, the Server field of the desktop app.
+
+Settings (`.env.example`): `CLARA_TAILSCALE` (`off`, `serve`, `funnel`), `CLARA_TAILSCALE_PORT` (443, 8443 or
+10000: the only HTTPS ports Tailscale offers; Clara owns it while this is on), `CLARA_TAILSCALE_BIN`.
+
+**With `funnel`**, anyone who finds the address can try tokens, so:
+
+- every token (chat and admin) must have at least 32 characters, or the server refuses to start. Users are
+  protected by their passwords (10 characters or more) and by the limit on wrong ones, so give them long ones;
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"` makes one;
+- the remote admin console (`CLARA_ADMIN_TOKENS`) is public as well: leave it empty unless you need it;
+- wrong tokens are limited per address (see *Security*), and the traffic log shows the real address of each
+  request in `from`: the server trusts `X-Forwarded-For` from `127.0.0.1` and `::1` only, which is where
+  tailscaled connects from.
+- the traffic log holds everything people say (see *Traffic log*).
+
+Keep `CLARA_HOST=127.0.0.1`: with `0.0.0.0` the plain HTTP port stays reachable on your network too (the
+server warns).
 
 ## Running on a Linux server
 
 See `deploy/clara.service` (systemd). Ollama must be reachable from the server
-(`OLLAMA_HOST`), or use a `-cloud` model.
+(`OLLAMA_HOST`), or use a `-cloud` model. To publish it with Tailscale, see above; the service starts after
+`tailscaled`.
 
 ## Layout
 
@@ -397,6 +537,13 @@ src/clara/
   providers.py  local / cloud providers, switchable live, saved in runtime.json
   tools.py      tools the model can call
   reminders.py  reminders: parsing, repeats, the scheduler
+  users.py      users, password hashes, login tokens (the tables are in memory.py)
+  auth.py       who is calling (client token, user token or web cookie) and what they may touch
+  webapi.py     login, account, administration and PDF routes, and the web site's files
+  web/          the web site: index.html, style.css and ES modules (chat, memory, account, admin, markdown...)
+  session.py    for clara-chat / clara-admin: sign in once, keep the token
+  tailscale.py  publishes the server with `tailscale serve|funnel`, removes it on exit
+  ratelimit.py  refuses an address that sends too many wrong tokens
   notifications.py  notifications, and each listener's stream of events (reminders, notifications, server state)
   announce.py   Clara writes the announcement of a reminder that came due
   traffic.py    the traffic log: every request in and out, in data/logs
@@ -405,6 +552,8 @@ src/clara/
   compaction.py transcript and summary request for long conversations
   commands.py   the console commands (/provider, /status...), shared by both consoles
   console.py    the interactive prompt (history, completion)
+  headless.py   `--headless`: ignore SIGHUP, leave the terminal, log to a rotating file
+  selftest.py   `--test`: the checks run before the server starts
   server.py     FastAPI routes, auth, embedded console
   client.py     clara-chat (also shows reminders and notifications, and has /remind and /notify)
   admin.py      clara-admin (remote console)

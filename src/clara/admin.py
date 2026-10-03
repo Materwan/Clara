@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
+from . import session
 from .commands import CommandResult
 from .console import run_console
 
@@ -72,16 +73,26 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="clara-admin", description="Remote Clara console.")
     parser.add_argument("--url", default=os.getenv("CLARA_URL", "http://127.0.0.1:8765"))
-    parser.add_argument("--token", default=os.getenv("CLARA_ADMIN_TOKEN"), help="or CLARA_ADMIN_TOKEN")
+    parser.add_argument("--token", default=os.getenv("CLARA_ADMIN_TOKEN"), help="an admin token (CLARA_ADMIN_TOKEN)")
+    parser.add_argument(
+        "--user", default=os.getenv("CLARA_USER"),
+        help="or sign in as an administrator user (CLARA_USER): the password is asked once (or CLARA_PASSWORD)",
+    )
     parser.add_argument("command", nargs="*", help="run this command and exit, e.g. /status")
     args = parser.parse_args()
-    if not args.token:
-        raise SystemExit("No admin token: pass --token or set CLARA_ADMIN_TOKEN.")
     for stream in (sys.stdout, sys.stderr):  # Windows consoles are not always UTF-8
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    token = args.token
+    if not token and args.user:
+        try:
+            token = session.obtain_token(args.url, args.user.lower(), "console")
+        except session.LoginError as error:
+            raise SystemExit(f"Cannot sign in: {error}") from None
+    if not token:
+        raise SystemExit("No admin token: pass --token (CLARA_ADMIN_TOKEN), or --user (CLARA_USER) to sign in as an administrator.")
     try:
-        asyncio.run(amain(args.url, args.token, " ".join(args.command)))
+        asyncio.run(amain(args.url, token, " ".join(args.command)))
     except KeyboardInterrupt:
         pass
 
