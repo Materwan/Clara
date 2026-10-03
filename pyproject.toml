@@ -30,7 +30,7 @@ clara-admin = "clara.admin:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-clara = ["web/*"]  # the web site
+clara = ["web/*", "web/fonts/*"]  # the web site and its fonts
 
 [tool.ruff]
 line-length = 120
